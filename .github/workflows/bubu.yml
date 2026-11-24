@@ -1,0 +1,79 @@
+name: BUBU CI
+
+on:
+  push:
+    branches: [gpui]
+    tags: ['v*']
+  pull_request:
+    branches: [gpui]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: swatinem/rust-cache@v2.9.2
+      - name: Source module size
+        run: ./scripts/check-source-size.ps1
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Check
+        run: cargo check --workspace --all-targets --locked
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: ./scripts/run-ci-command.ps1 -LogName tests -Program cargo -CommandArgs @('test', '--workspace', '--locked')
+      - name: Isolated Windows clipboard roundtrip
+        timeout-minutes: 5
+        run: ./scripts/run-ci-command.ps1 -LogName clipboard-smoke -Program cargo -CommandArgs @('run', '-p', 'clipboard-platform', '--example', 'isolated_clipboard_smoke', '--locked')
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          # choco 成功码不保证本 job PATH/落盘可用；合并后偶发「Install NSIS ✓」但 makensis 找不到。
+          choco install nsis -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "NSIS install failed: $LASTEXITCODE" }
+          $candidates = @(
+            (Join-Path ${env:ProgramFiles} 'NSIS\makensis.exe'),
+            (Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe')
+          )
+          $makensis = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          if (-not $makensis) {
+            choco install nsis -y --force --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "NSIS force reinstall failed: $LASTEXITCODE" }
+            $makensis = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          }
+          if (-not $makensis) {
+            throw "makensis missing after choco install. Checked: $($candidates -join '; ')"
+          }
+          $nsisDir = Split-Path -Parent $makensis
+          Add-Content -Path $env:GITHUB_PATH -Value $nsisDir
+          $env:Path = "$nsisDir;$env:Path"
+          & $makensis /VERSION
+          if ($LASTEXITCODE -ne 0) { throw "makensis /VERSION failed: $LASTEXITCODE" }
+          Write-Host "NSIS ready: $makensis"
+      - name: Build Windows package
+        run: |
+          ./scripts/package-gpui-windows.ps1
+          if (-not (Test-Path -Path 'target/packages/*-windows-x64-setup.exe' -PathType Leaf)) {
+            throw 'Windows x64 NSIS installer missing from target/packages.'
+          }
+      - name: Built and unpacked Windows startup
+        timeout-minutes: 3
+        run: ./scripts/run-ci-command.ps1 -LogName windows-startup -Program pwsh -CommandArgs @('-File', './scripts/smoke-gpui-windows-package.ps1', '-Archive', (Get-Item target/packages/*-windows-x64.zip).FullName, '-Executable', './target/release/ElegantClipboard.exe')
+      - name: Upload validated Windows package
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: package-windows-x64
+          path: |
+            target/packages/*-windows-x64.zip
+            target/packages/*-windows-x64-setup.exe
+          if-no-files-found: error
