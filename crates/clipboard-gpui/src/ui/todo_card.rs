@@ -63,7 +63,16 @@ impl TodoDragSnapshot {
             })
             .child(
                 div()
-                    .when_some(expanded_body, |body, height| body.h(height))
+                    .when_some(expanded_body, |body, height| {
+                        body.h(height).capture_any_mouse_up(|event, window, cx| {
+                            if event.button == MouseButton::Left && !window.is_window_active() {
+                                // Finish the selection before activation can change window bounds.
+                                window.defer(cx, |window, _| {
+                                    native_window::activate_for_input(window);
+                                });
+                            }
+                        })
+                    })
                     .flex_none()
                     .min_w_0()
                     .overflow_hidden()
@@ -240,7 +249,7 @@ impl ClipboardView {
         };
         if self.memo_preview == Some(id) {
             let body_height = card_layout.body_height(row_height, true);
-            return Self::todo_row_frame(id, card_layout, row_height)
+            return Self::todo_row_frame(todo, card_layout, row_height, cx)
                 .child(
                     snapshot
                         .surface(
@@ -284,12 +293,10 @@ impl ClipboardView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = todo.id;
-        let status = todo.status;
         let text = snapshot.text.clone();
         let layout = snapshot.layout;
         let pending = self.todos_pending;
         let entity = cx.entity();
-        let menu_owner = entity.clone();
         let card_padding = visual::card_padding(layout.density);
         let measured_size = Rc::new(Cell::new(size(px(0.), px(0.))));
         let surface = snapshot
@@ -305,7 +312,7 @@ impl ClipboardView {
         let drag_enabled = !pending && !self.todo_reorder_pending && self.todos_open;
         let measured_layout = self.todo_layout.clone();
         let list = self.list_surface.downgrade();
-        Self::todo_row_frame(id, layout, row_height)
+        Self::todo_row_frame(todo, layout, row_height, cx)
             .child(
                 div()
                     .relative()
@@ -334,20 +341,6 @@ impl ClipboardView {
                 cx.listener(move |this, _, _, cx| {
                     this.prepare_memo_drag(id, &text, cx);
                 }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                move |event: &MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    ClipboardView::open_todo_menu(
-                        menu_owner.clone(),
-                        id,
-                        status,
-                        event.position,
-                        window,
-                        cx,
-                    );
-                },
             )
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.open_memo_preview(id, window, cx);
@@ -379,7 +372,14 @@ impl ClipboardView {
             .into_any_element()
     }
 
-    fn todo_row_frame(id: i64, layout: MemoCardLayout, height: Pixels) -> Stateful<Div> {
+    fn todo_row_frame(
+        todo: &Todo,
+        layout: MemoCardLayout,
+        height: Pixels,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let (id, status) = (todo.id, todo.status);
+        let owner = cx.weak_entity();
         div()
             .id(("todo-row", id as usize))
             .relative()
@@ -391,6 +391,15 @@ impl ClipboardView {
             .overflow_hidden()
             .px(px(PAGE_PADDING))
             .py(px(visual::card_spacing(layout.density)))
+            .on_mouse_down(
+                MouseButton::Right,
+                move |event: &MouseDownEvent, window, cx| {
+                    if let Some(owner) = owner.upgrade() {
+                        cx.stop_propagation();
+                        Self::open_todo_menu(owner, id, status, event.position, window, cx);
+                    }
+                },
+            )
     }
 }
 
