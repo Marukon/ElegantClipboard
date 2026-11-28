@@ -11,11 +11,17 @@ gpui_kit::assets::icon_assets!(
 struct AppAssets;
 
 const APP_ICON: &[u8] = include_bytes!("../../../../assets/elegant-clipboard.png");
+pub(super) const PIN_BOOKMARK_ASSET: &str = "pin-bookmark.svg";
 
 impl AssetSource for AppAssets {
     fn load(&self, path: &str) -> anyhow::Result<Option<std::borrow::Cow<'static, [u8]>>> {
         if path == "app-icon.png" {
             return Ok(Some(std::borrow::Cow::Borrowed(APP_ICON)));
+        }
+        if path == PIN_BOOKMARK_ASSET {
+            return Ok(Some(std::borrow::Cow::Borrowed(include_bytes!(
+                "../../../../assets/pin-bookmark.svg"
+            ))));
         }
         if let Some(icon) = ActionIcons.load(path)? {
             return Ok(Some(icon));
@@ -30,6 +36,9 @@ impl AssetSource for AppAssets {
         let mut paths = gpui_kit::assets::Assets.list(path)?;
         paths.extend(ActionIcons.list(path)?);
         paths.extend(EmptyStateIcons.list(path)?);
+        if PIN_BOOKMARK_ASSET.starts_with(path) {
+            paths.push(PIN_BOOKMARK_ASSET.into());
+        }
         Ok(paths)
     }
 }

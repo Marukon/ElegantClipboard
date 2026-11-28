@@ -1,7 +1,36 @@
 mod motion;
 
 use super::*;
-use gpui_kit::component::tag::Tag;
+
+const PIN_BOOKMARK_WIDTH_REM: f32 = 0.75;
+
+fn pin_bookmark_inset(cx: &App) -> Pixels {
+    cx.theme()
+        .font_size
+        .max(crate::card_radius::card_radius(cx))
+}
+
+pub(super) fn pin_bookmark_clearance(cx: &App) -> Pixels {
+    pin_bookmark_inset(cx) + cx.theme().font_size * (PIN_BOOKMARK_WIDTH_REM + 0.25)
+}
+
+fn pin_bookmark(language: LanguagePreference, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    div()
+        .id("pin-bookmark")
+        .aria_label(tr(language, "置顶", "Pinned"))
+        .absolute()
+        .top_0()
+        .right(pin_bookmark_inset(cx))
+        .w(theme.font_size * PIN_BOOKMARK_WIDTH_REM)
+        .h(theme.font_size * 1.375)
+        .child(
+            svg()
+                .path(startup::PIN_BOOKMARK_ASSET)
+                .size_full()
+                .text_color(theme.primary),
+        )
+}
 
 #[derive(Clone)]
 pub(super) struct CardText {
@@ -257,13 +286,7 @@ impl HistoryCardSnapshot {
         )
     }
 
-    pub(super) fn surface(
-        &self,
-        preview: bool,
-        show_pin: bool,
-        drop_hint: Option<&'static str>,
-        cx: &App,
-    ) -> Div {
+    pub(super) fn surface(&self, preview: bool, drop_hint: Option<&'static str>, cx: &App) -> Div {
         let media_layout = self.is_image || self.is_files;
         let spacing = visual::card_spacing(self.display.card_density);
         let padding = visual::card_padding(self.display.card_density);
@@ -303,27 +326,12 @@ impl HistoryCardSnapshot {
             .flex_col()
             .gap(px(spacing))
             .child(body.when(self.is_pinned, |body| {
-                let theme = cx.theme();
-                body.child(
-                    Tag::custom(
-                        theme.accent,
-                        theme.accent_foreground,
-                        theme.ring.opacity(0.6),
-                    )
-                    .small()
-                    .rounded(theme.radius)
-                    .h(px(visual::METADATA_ROW_HEIGHT))
-                    .px(px(visual::SPACE_3 / 2.))
-                    .py(px(0.))
-                    .flex_none()
-                    .text_size(px(visual::TEXT_SMALL))
-                    .whitespace_nowrap()
-                    .when(!media_layout, |tag| tag.ml(px(visual::SPACE_2)))
-                    .when(!show_pin, |tag| tag.invisible())
-                    .child(tr(self.language, "置顶", "Pinned")),
-                )
+                body.pr((pin_bookmark_clearance(cx) - px(padding)).max(px(0.)))
             }))
             .child(self.metadata_row(drop_hint, cx))
+            .when(self.is_pinned, |card| {
+                card.child(pin_bookmark(self.language, cx))
+            })
     }
 }
 
@@ -351,7 +359,7 @@ impl HistoryDrag {
             .get()
             .then(|| favorite_drop::release_hint(self.card.language, self.favorite_only));
         drag_card(self.size(), self.card.display.card_density, cx)
-            .child(self.card.surface(true, true, drop_hint, cx))
+            .child(self.card.surface(true, drop_hint, cx))
             .into_any_element()
     }
 }

@@ -140,7 +140,11 @@ impl ClipboardView {
         div()
             .absolute()
             .top(px(card_padding))
-            .right(px(card_padding))
+            .right(if pinned {
+                drag_visual::pin_bookmark_clearance(cx)
+            } else {
+                px(card_padding)
+            })
             .h(px(visual::CONTROL_HEIGHT_COMPACT))
             .px(px(visual::SPACE_1 / 2.))
             .flex()

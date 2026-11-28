@@ -170,7 +170,7 @@ impl OnboardingFavorites {
                 });
                 cx.new(|_| preview)
             })
-            .child(self.sample.surface(false, false, None, cx))
+            .child(self.sample.surface(false, None, cx))
             .child(
                 canvas(
                     move |bounds, _, _| dimensions.set(bounds.size),
@@ -311,7 +311,7 @@ impl Render for FavoritePreview {
         div()
             .w(self.dimensions.width)
             .h(self.dimensions.height)
-            .child(self.sample.surface(true, false, hint, cx))
+            .child(self.sample.surface(true, hint, cx))
     }
 }
 

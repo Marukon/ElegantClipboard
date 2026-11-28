@@ -177,10 +177,8 @@ impl ClipboardView {
             window,
             cx,
         );
-        // The corner is shared with the action bar; keep the title width fixed during hover.
-        let show_pin = self.batch_mode || action_opacity == 0.;
         let surface = card
-            .surface(false, show_pin, None, cx)
+            .surface(false, None, cx)
             .bg(background)
             .border_color(border);
         let measured_size = Rc::new(Cell::new(size(px(0.), px(0.))));
