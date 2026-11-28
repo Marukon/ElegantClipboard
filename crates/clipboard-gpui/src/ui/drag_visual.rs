@@ -2,34 +2,148 @@ mod motion;
 
 use super::*;
 
-const PIN_BOOKMARK_WIDTH_REM: f32 = 0.75;
+use clipboard_core::preferences::PinMarkerStyle;
 
-fn pin_bookmark_inset(cx: &App) -> Pixels {
-    cx.theme()
-        .font_size
-        .max(crate::card_radius::card_radius(cx))
+struct PinMarker {
+    style: PinMarkerStyle,
+    inset: Pixels,
+    size: gpui_kit::Size<Pixels>,
 }
 
-pub(super) fn pin_bookmark_clearance(cx: &App) -> Pixels {
-    pin_bookmark_inset(cx) + cx.theme().font_size * (PIN_BOOKMARK_WIDTH_REM + 0.25)
+impl PinMarker {
+    fn new(style: PinMarkerStyle, cx: &App) -> Self {
+        let em = cx.theme().font_size;
+        let radius = crate::card_radius::card_radius(cx);
+        match style {
+            PinMarkerStyle::Swallowtail => Self {
+                style,
+                inset: (em * 0.875).max(radius),
+                size: size(em * 0.6875, em * 1.25),
+            },
+            PinMarkerStyle::FoldedCorner => {
+                // Both ends of the fold meet the straight edges, even at a large radius.
+                let side = (em * 1.125).max(radius);
+                Self {
+                    style,
+                    inset: px(0.),
+                    size: size(side, side),
+                }
+            }
+        }
+    }
+
+    fn clearance(&self, cx: &App) -> Pixels {
+        self.inset + self.size.width + cx.theme().font_size * 0.25
+    }
+
+    fn render(&self, language: LanguagePreference, cx: &App) -> impl IntoElement {
+        let marker = div()
+            .id("pin-marker")
+            .aria_label(tr(language, "置顶", "Pinned"))
+            .absolute()
+            .top_0()
+            .right(self.inset)
+            .w(self.size.width)
+            .h(self.size.height);
+        if self.style == PinMarkerStyle::FoldedCorner {
+            return marker.child(folded_corner(cx));
+        }
+        let theme = cx.theme();
+        let dark = theme.is_dark();
+        let shadow_offset = theme.font_size * 0.09;
+        let (shadow, ribbon) = if dark {
+            (
+                theme.popover.opacity(0.65),
+                theme.accent_foreground.opacity(0.86),
+            )
+        } else {
+            (theme.foreground.opacity(0.22), theme.primary)
+        };
+        marker
+            .child(
+                svg()
+                    .path(startup::PIN_BOOKMARK_ASSET)
+                    .absolute()
+                    .top(shadow_offset)
+                    .left(-shadow_offset)
+                    .size_full()
+                    .text_color(shadow),
+            )
+            .child(
+                svg()
+                    .path(startup::PIN_BOOKMARK_ASSET)
+                    .size_full()
+                    .text_color(ribbon),
+            )
+    }
 }
 
-fn pin_bookmark(language: LanguagePreference, cx: &App) -> impl IntoElement {
+fn folded_corner(cx: &App) -> impl IntoElement {
     let theme = cx.theme();
-    div()
-        .id("pin-bookmark")
-        .aria_label(tr(language, "置顶", "Pinned"))
-        .absolute()
-        .top_0()
-        .right(pin_bookmark_inset(cx))
-        .w(theme.font_size * PIN_BOOKMARK_WIDTH_REM)
-        .h(theme.font_size * 1.375)
-        .child(
-            svg()
-                .path(startup::PIN_BOOKMARK_ASSET)
-                .size_full()
-                .text_color(theme.primary),
-        )
+    // Match the card's inner arc on both the outer edge and the folded tip.
+    let radius = (crate::card_radius::card_radius(cx) - px(visual::BORDER_WIDTH)).max(px(0.));
+    let (crease, light) = if theme.is_dark() {
+        (theme.primary, theme.accent_foreground.opacity(0.74))
+    } else {
+        (theme.primary_hover, theme.primary_foreground.opacity(0.46))
+    };
+    let corner = theme.primary.opacity(0.16);
+    let face = linear_gradient(
+        225.,
+        linear_color_stop(crease, 0.5),
+        linear_color_stop(crease.blend(light), 0.82),
+    );
+    canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _| {
+            let side = bounds.size.width;
+            let zero = px(0.);
+            let finish = |path: &mut PathBuilder| {
+                path.line_to(point(side, side));
+                path.line_to(point(radius, side));
+                if radius > zero {
+                    path.arc_to(
+                        point(radius, radius),
+                        zero,
+                        false,
+                        true,
+                        point(zero, side - radius),
+                    );
+                }
+                path.close();
+                path.translate(bounds.origin);
+            };
+
+            let mut backing = PathBuilder::fill();
+            backing.move_to(point(zero, zero));
+            backing.line_to(point(side - radius, zero));
+            if radius > zero {
+                backing.arc_to(
+                    point(radius, radius),
+                    zero,
+                    false,
+                    true,
+                    point(side, radius),
+                );
+            }
+            finish(&mut backing);
+            if let Ok(path) = backing.build() {
+                window.paint_path(path, corner);
+            }
+
+            let mut flap = PathBuilder::fill();
+            flap.move_to(point(zero, zero));
+            finish(&mut flap);
+            if let Ok(path) = flap.build() {
+                window.paint_path(path, face);
+            }
+        },
+    )
+    .size_full()
+}
+
+pub(super) fn pin_marker_clearance(style: PinMarkerStyle, cx: &App) -> Pixels {
+    PinMarker::new(style, cx).clearance(cx)
 }
 
 #[derive(Clone)]
@@ -290,6 +404,9 @@ impl HistoryCardSnapshot {
         let media_layout = self.is_image || self.is_files;
         let spacing = visual::card_spacing(self.display.card_density);
         let padding = visual::card_padding(self.display.card_density);
+        let pin = self
+            .is_pinned
+            .then(|| PinMarker::new(self.display.pin_marker_style, cx));
         let body = div().min_w_0().overflow_hidden().flex().items_start();
         // The summary stays on its own row. Beside a thumbnail it wraps mid-token
         // ("今天 20" / "24 · 文件") once the source name takes the remaining width.
@@ -325,12 +442,12 @@ impl HistoryCardSnapshot {
             .flex()
             .flex_col()
             .gap(px(spacing))
-            .child(body.when(self.is_pinned, |body| {
-                body.pr((pin_bookmark_clearance(cx) - px(padding)).max(px(0.)))
+            .child(body.when_some(pin.as_ref(), |body, pin| {
+                body.pr((pin.clearance(cx) - px(padding)).max(px(0.)))
             }))
             .child(self.metadata_row(drop_hint, cx))
-            .when(self.is_pinned, |card| {
-                card.child(pin_bookmark(self.language, cx))
+            .when_some(pin.as_ref(), |card, pin| {
+                card.child(pin.render(self.language, cx))
             })
     }
 }

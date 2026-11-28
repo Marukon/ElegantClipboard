@@ -141,7 +141,7 @@ impl ClipboardView {
             .absolute()
             .top(px(card_padding))
             .right(if pinned {
-                drag_visual::pin_bookmark_clearance(cx)
+                drag_visual::pin_marker_clearance(self.display.value.pin_marker_style, cx)
             } else {
                 px(card_padding)
             })

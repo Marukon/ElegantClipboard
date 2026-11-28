@@ -5,7 +5,7 @@ use super::settings_common::{
     settings_field_help, settings_inline, settings_number_field, settings_stack, settings_toggle,
 };
 use super::*;
-use clipboard_core::preferences::CardCornerPreference;
+use clipboard_core::preferences::{CardCornerPreference, PinMarkerStyle};
 use gpui_kit::component::{checkbox::Checkbox, input::NumberInput};
 
 impl SettingsWindowView {
@@ -246,6 +246,30 @@ impl SettingsWindowView {
                         owner.save_display(
                             DisplayPreference {
                                 card_density: density,
+                                ..owner.display.value
+                            },
+                            cx,
+                        );
+                    },
+                    cx,
+                )),
+            )
+            .child(
+                settings_field(tr(language, "置顶标识", "Pin marker")).child(choice_tabs(
+                    "pin-marker-style",
+                    &self.owner,
+                    [PinMarkerStyle::Swallowtail, PinMarkerStyle::FoldedCorner],
+                    [
+                        tr(language, "燕尾缺口", "Swallowtail"),
+                        tr(language, "折角", "Folded corner"),
+                    ],
+                    display.pin_marker_style,
+                    display_pending,
+                    |owner| owner.display.value.pin_marker_style,
+                    |owner, style, cx| {
+                        owner.save_display(
+                            DisplayPreference {
+                                pin_marker_style: style,
                                 ..owner.display.value
                             },
                             cx,
