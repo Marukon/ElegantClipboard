@@ -1,7 +1,188 @@
 mod motion;
 
 use super::*;
-use gpui_kit::component::tag::Tag;
+
+use clipboard_core::preferences::PinMarkerStyle;
+
+struct PinMarker {
+    style: PinMarkerStyle,
+    inset: Pixels,
+    size: gpui_kit::Size<Pixels>,
+}
+
+impl PinMarker {
+    fn new(style: PinMarkerStyle, cx: &App) -> Self {
+        let em = cx.theme().font_size;
+        let radius = crate::card_radius::card_radius(cx);
+        match style {
+            PinMarkerStyle::Swallowtail => Self {
+                style,
+                inset: (em * 0.875).max(radius),
+                size: size(em * 0.6875, em * 1.25),
+            },
+            PinMarkerStyle::FoldedCorner => {
+                // Both ends of the fold meet the straight edges, even at a large radius.
+                let side = (em * 1.125).max(radius);
+                Self {
+                    style,
+                    inset: px(0.),
+                    size: size(side, side),
+                }
+            }
+        }
+    }
+
+    fn clearance(&self, cx: &App) -> Pixels {
+        self.inset + self.size.width + cx.theme().font_size * 0.25
+    }
+
+    fn render(&self, language: LanguagePreference, cx: &App) -> impl IntoElement {
+        let marker = div()
+            .id("pin-marker")
+            .aria_label(tr(language, "置顶", "Pinned"))
+            .absolute()
+            .top_0()
+            .right(self.inset)
+            .w(self.size.width)
+            .h(self.size.height);
+        if self.style == PinMarkerStyle::FoldedCorner {
+            return marker.child(folded_corner(cx));
+        }
+        let theme = cx.theme();
+        let dark = theme.is_dark();
+        let shadow_offset = theme.font_size * 0.09;
+        let (shadow, ribbon) = if dark {
+            (
+                theme.popover.opacity(0.65),
+                theme.accent_foreground.opacity(0.86),
+            )
+        } else {
+            (theme.foreground.opacity(0.22), theme.primary)
+        };
+        marker
+            .child(
+                svg()
+                    .path(startup::PIN_BOOKMARK_ASSET)
+                    .absolute()
+                    .top(shadow_offset)
+                    .left(-shadow_offset)
+                    .size_full()
+                    .text_color(shadow),
+            )
+            .child(
+                svg()
+                    .path(startup::PIN_BOOKMARK_ASSET)
+                    .size_full()
+                    .text_color(ribbon),
+            )
+    }
+}
+
+fn folded_corner(cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    // Match the card's inner arc on both the outer edge and the folded tip.
+    let radius = (crate::card_radius::card_radius(cx) - px(visual::BORDER_WIDTH)).max(px(0.));
+    let (crease, light) = if theme.is_dark() {
+        (theme.primary, theme.accent_foreground.opacity(0.74))
+    } else {
+        (theme.primary_hover, theme.primary_foreground.opacity(0.46))
+    };
+    let corner = theme.primary.opacity(0.16);
+    let face = linear_gradient(
+        225.,
+        linear_color_stop(crease, 0.5),
+        linear_color_stop(crease.blend(light), 0.82),
+    );
+    canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _| {
+            let side = bounds.size.width;
+            let zero = px(0.);
+            let finish = |path: &mut PathBuilder| {
+                path.line_to(point(side, side));
+                path.line_to(point(radius, side));
+                if radius > zero {
+                    path.arc_to(
+                        point(radius, radius),
+                        zero,
+                        false,
+                        true,
+                        point(zero, side - radius),
+                    );
+                }
+                path.close();
+                path.translate(bounds.origin);
+            };
+
+            let mut backing = PathBuilder::fill();
+            backing.move_to(point(zero, zero));
+            backing.line_to(point(side - radius, zero));
+            if radius > zero {
+                backing.arc_to(
+                    point(radius, radius),
+                    zero,
+                    false,
+                    true,
+                    point(side, radius),
+                );
+            }
+            finish(&mut backing);
+            if let Ok(path) = backing.build() {
+                window.paint_path(path, corner);
+            }
+
+            let mut flap = PathBuilder::fill();
+            flap.move_to(point(zero, zero));
+            finish(&mut flap);
+            if let Ok(path) = flap.build() {
+                window.paint_path(path, face);
+            }
+        },
+    )
+    .size_full()
+}
+
+pub(super) fn pin_marker_clearance(style: PinMarkerStyle, cx: &App) -> Pixels {
+    PinMarker::new(style, cx).clearance(cx)
+}
+
+#[derive(Clone)]
+pub(super) struct CardText {
+    text: SharedString,
+    highlights: Vec<(std::ops::Range<usize>, HighlightStyle)>,
+}
+
+impl CardText {
+    pub(super) fn plain(text: impl Into<SharedString>) -> Self {
+        Self {
+            text: text.into(),
+            highlights: Vec::new(),
+        }
+    }
+
+    pub(super) fn searched(text: impl Into<SharedString>, search: &str, cx: &App) -> Self {
+        let mut label = Self::plain(text);
+        label.highlights = clipboard_core::search::search_highlight_ranges(&label.text, search)
+            .into_iter()
+            .map(|range| {
+                (
+                    range,
+                    HighlightStyle {
+                        color: Some(cx.theme().blue),
+                        background_color: Some(cx.theme().primary.opacity(0.18)),
+                        font_weight: Some(FontWeight::SEMIBOLD),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        label
+    }
+
+    fn styled(&self) -> StyledText {
+        StyledText::new(self.text.clone()).with_highlights(self.highlights.clone())
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct HistoryCardSnapshot {
@@ -14,8 +195,9 @@ pub(super) struct HistoryCardSnapshot {
     pub(super) display: DisplayPreference,
     pub(super) language: LanguagePreference,
     pub(super) summary: String,
-    pub(super) preview_text: String,
-    pub(super) highlights: Vec<(std::ops::Range<usize>, HighlightStyle)>,
+    pub(super) title: CardText,
+    pub(super) is_note: bool,
+    pub(super) source_match: Option<CardText>,
     pub(super) thumbnail_path: Option<PathBuf>,
     // Cloning a drag snapshot also retains the decoded pixels after list eviction.
     pub(super) thumbnail: Option<gpui_kit::ImageSource>,
@@ -44,7 +226,7 @@ impl HistoryCardSnapshot {
             .text_color(if self.file_warning {
                 cx.theme().danger
             } else {
-                cx.theme().muted_foreground
+                cx.theme().muted_foreground.opacity(0.85)
             })
             .child(
                 div()
@@ -198,25 +380,33 @@ impl HistoryCardSnapshot {
             } else {
                 cx.theme().foreground
             });
-        if self.is_image {
+        let title = if self.is_image && !self.is_note {
             text.font_medium().child(tr(self.language, "图片", "Image"))
         } else {
-            text.child(
-                StyledText::new(self.preview_text.clone()).with_highlights(self.highlights.clone()),
-            )
-        }
+            text.child(self.title.styled())
+        };
+        let Some(source) = self.source_match.as_ref() else {
+            return title;
+        };
+        div().min_w_0().flex().flex_col().child(title).child(
+            div()
+                .min_w_0()
+                .h(px(visual::PREVIEW_LINE_HEIGHT))
+                .line_clamp(1)
+                .text_ellipsis()
+                .text_size(px(visual::TEXT_SMALL))
+                .text_color(cx.theme().muted_foreground)
+                .child(source.styled()),
+        )
     }
 
-    pub(super) fn surface(
-        &self,
-        preview: bool,
-        show_pin: bool,
-        drop_hint: Option<&'static str>,
-        cx: &App,
-    ) -> Div {
+    pub(super) fn surface(&self, preview: bool, drop_hint: Option<&'static str>, cx: &App) -> Div {
         let media_layout = self.is_image || self.is_files;
         let spacing = visual::card_spacing(self.display.card_density);
         let padding = visual::card_padding(self.display.card_density);
+        let pin = self
+            .is_pinned
+            .then(|| PinMarker::new(self.display.pin_marker_style, cx));
         let body = div().min_w_0().overflow_hidden().flex().items_start();
         // The summary stays on its own row. Beside a thumbnail it wraps mid-token
         // ("今天 20" / "24 · 文件") once the source name takes the remaining width.
@@ -252,28 +442,13 @@ impl HistoryCardSnapshot {
             .flex()
             .flex_col()
             .gap(px(spacing))
-            .child(body.when(self.is_pinned, |body| {
-                let theme = cx.theme();
-                body.child(
-                    Tag::custom(
-                        theme.accent,
-                        theme.accent_foreground,
-                        theme.ring.opacity(0.6),
-                    )
-                    .small()
-                    .rounded(theme.radius)
-                    .h(px(visual::METADATA_ROW_HEIGHT))
-                    .px(px(visual::SPACE_3 / 2.))
-                    .py(px(0.))
-                    .flex_none()
-                    .text_size(px(visual::TEXT_SMALL))
-                    .whitespace_nowrap()
-                    .when(!media_layout, |tag| tag.ml(px(visual::SPACE_2)))
-                    .when(!show_pin, |tag| tag.invisible())
-                    .child(tr(self.language, "置顶", "Pinned")),
-                )
+            .child(body.when_some(pin.as_ref(), |body, pin| {
+                body.pr((pin.clearance(cx) - px(padding)).max(px(0.)))
             }))
             .child(self.metadata_row(drop_hint, cx))
+            .when_some(pin.as_ref(), |card, pin| {
+                card.child(pin.render(self.language, cx))
+            })
     }
 }
 
@@ -301,7 +476,7 @@ impl HistoryDrag {
             .get()
             .then(|| favorite_drop::release_hint(self.card.language, self.favorite_only));
         drag_card(self.size(), self.card.display.card_density, cx)
-            .child(self.card.surface(true, true, drop_hint, cx))
+            .child(self.card.surface(true, drop_hint, cx))
             .into_any_element()
     }
 }

@@ -31,7 +31,7 @@ fn preview_image_path(preview: &PreviewState) -> Option<PathBuf> {
 }
 
 impl ClipboardView {
-    pub(super) fn update_image_visible_range(
+    pub(super) fn update_history_visible_range(
         &mut self,
         visible: Range<usize>,
         window: &Window,
@@ -45,6 +45,7 @@ impl ClipboardView {
             self.image_sync_pending = true;
             cx.defer_in(window, |this, window, cx| {
                 this.image_sync_pending = false;
+                this.request_history_pages(cx);
                 this.sync_image_assets(cx);
                 this.start_thumbnail_jobs(cx);
                 this.release_thumbnail_atlas(window, cx);
@@ -58,29 +59,33 @@ impl ClipboardView {
         let image_dimensions = visual::thumbnail_size(self.display.value.card_density);
         let scale = self.thumbnail_scale;
         let file_card_info = &self.file_card_info;
-        let wanted = self.history.items[range.clone()].iter().filter_map(|item| {
-            let is_image = item.content_type == "image";
-            let path = if is_image {
-                item.image_path.as_ref().map(PathBuf::from)
-            } else {
-                file_card_info
-                    .get(&item.id)
-                    .and_then(|info| info.image_path.clone())
-            }?;
-            Some(thumbnail_cache::ThumbnailKey::new(
-                path,
-                item.content_hash.clone(),
-                item.content_type == "files",
-                if is_image {
-                    image_dimensions
+        let wanted = self
+            .history
+            .items
+            .loaded_range(range.clone())
+            .filter_map(|item| {
+                let is_image = item.content_type == "image";
+                let path = if is_image {
+                    item.image_path.as_ref().map(PathBuf::from)
                 } else {
-                    (48., 36.)
-                },
-                scale,
-            ))
-        });
+                    file_card_info
+                        .get(&item.id)
+                        .and_then(|info| info.image_path.clone())
+                }?;
+                Some(thumbnail_cache::ThumbnailKey::new(
+                    path,
+                    item.content_hash.clone(),
+                    item.content_type == "files",
+                    if is_image {
+                        image_dimensions
+                    } else {
+                        (48., 36.)
+                    },
+                    scale,
+                ))
+            });
         self.thumbnails.retain(wanted);
-        let rows = self.history.items[range].iter().map(|item| {
+        let rows = self.history.items.loaded_range(range).map(|item| {
             let image = (item.content_type == "image")
                 .then(|| item.image_path.as_ref().map(PathBuf::from))
                 .flatten();
@@ -103,6 +108,7 @@ impl ClipboardView {
                 .history
                 .items
                 .iter()
+                .flatten()
                 .find(|item| item.id == id)
                 .and_then(|item| item.image_path.as_ref())
             {
@@ -116,7 +122,11 @@ impl ClipboardView {
                 pinned.push(path);
             }
         }
-        let needed = retained_image_paths(rows, pinned);
+        // Rows for animated formats render the original file: keep its decoded
+        // asset in GPUI's cache as long as the thumbnail entry is resident,
+        // or every scroll past the row forces a full reload.
+        let mut needed = retained_image_paths(rows, pinned);
+        needed.extend(self.thumbnails.original_paths());
         for path in self.rendered_images.difference(&needed) {
             ImageSource::from(path.clone()).remove_asset(cx);
         }
@@ -149,9 +159,11 @@ impl ClipboardView {
             cx.spawn(async move |view, cx| {
                 let result = task.await;
                 let _ = view.update(cx, |this, cx| {
-                    if let Some(path) = this.thumbnails.finish(token, result) {
-                        // Also invalidate the original-path fallback after external file changes.
-                        ImageSource::from(path).remove_asset(cx);
+                    if let Some((path, invalidate)) = this.thumbnails.finish(token, result) {
+                        // Invalidate the original-path asset only when the file changed.
+                        if invalidate {
+                            ImageSource::from(path).remove_asset(cx);
+                        }
                         cx.notify();
                     }
                     this.start_thumbnail_jobs(cx);
@@ -189,10 +201,10 @@ impl ClipboardView {
             cx.background_executor().timer(IMAGE_RELEASE_DELAY).await;
             let _ = view.update(cx, |this, cx| {
                 for path in std::mem::take(&mut this.rendered_images) {
-                    ImageSource::from(path).remove_asset(cx);
+                    ImageSource::from(path.clone()).remove_asset(cx);
                 }
                 this.image_visible_range = 0..0;
-                this.thumbnails.retain(Vec::new());
+                this.thumbnails.release_for_hidden();
             });
         }));
     }

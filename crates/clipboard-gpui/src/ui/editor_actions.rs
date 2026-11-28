@@ -14,10 +14,10 @@ impl ClipboardView {
                 .editor_input
                 .as_ref()
                 .is_some_and(|(input, original)| input.read(cx).text() != original)
-            || self
-                .todo_draft
-                .as_ref()
-                .is_some_and(|draft| draft.id.is_none() && draft.kind != MemoKind::Todo)
+            || matches!(
+                self.todo_draft,
+                Some(todo_editor::TodoDraft::New(MemoKind::Note))
+            )
     }
 
     pub(super) fn editor_draft_blocker(&self, cx: &App) -> Option<&'static str> {
@@ -258,15 +258,17 @@ impl ClipboardView {
             return true;
         }
         let note = self.note_original.is_some();
-        self.release_editor_session();
-        if let Some(handle) = self.editor_window.take() {
+        if let Some(handle) = self.editor_window {
             cx.defer(move |cx| {
                 let _ = handle.update(cx, |_, editor_window, _| editor_window.remove_window());
             });
-        } else if note {
-            self.note_input
-                .update(cx, |input, cx| input.set_value("", window, cx));
-            window.close_dialog(cx);
+        } else {
+            self.release_editor_session();
+            if note {
+                self.note_input
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                window.close_dialog(cx);
+            }
         }
         if !window.has_active_dialog(cx) {
             window.focus(&self.list_focus, cx);
@@ -351,7 +353,13 @@ impl ClipboardView {
         {
             return;
         }
-        let Some(item) = self.history.items.iter().find(|item| item.id == id) else {
+        let Some(item) = self
+            .history
+            .items
+            .iter()
+            .flatten()
+            .find(|item| item.id == id)
+        else {
             return;
         };
         if text && !item.kind().is_some_and(|kind| kind.is_text_like()) {
@@ -369,7 +377,7 @@ impl ClipboardView {
             if !self.send(Command::EditContent { id, generation }, cx) {
                 self.editor.apply(id, generation, Err(self.message.clone()));
             }
-            self.open_content_editor(id, window, cx);
+            self.open_editor_window(window, cx, None);
         } else {
             self.note_original = Some(self.note_input.update(cx, |input, cx| {
                 input.set_value(note, window, cx);

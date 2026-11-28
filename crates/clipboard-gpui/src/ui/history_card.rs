@@ -1,7 +1,6 @@
 use super::file_cards::{FileCardAvailability, FileCardKind};
 use super::presentation::content_type_label;
 use super::*;
-use clipboard_core::search::search_highlight_ranges;
 
 #[derive(Default)]
 struct CardHover {
@@ -16,7 +15,9 @@ impl ClipboardView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let item = &self.history.items[index];
+        let Some(item) = self.history.items[index].as_ref() else {
+            return self.render_skeleton_row(index, cx);
+        };
         let id = item.id;
         let is_image = item.content_type == "image";
         let is_files = item.content_type == "files";
@@ -62,11 +63,14 @@ impl ClipboardView {
         let focused = self.history.selected == Some(id);
         let selected = focused && !self.batch_mode;
         let marked = self.selected_ids.contains(&id);
-        let (preview_text, highlights) = if is_image {
-            (String::new(), Vec::new())
+        let note = card_note::note_title(item);
+        let search = self.row_search.as_ref();
+        let title = if let Some(note) = note {
+            drag_visual::CardText::searched(note.to_owned(), search, cx)
+        } else if is_image {
+            drag_visual::CardText::plain("")
         } else {
             let saved_preview = item.preview.as_deref().unwrap_or(kind);
-            let search = self.search.read(cx).value();
             let file_names = if file_paths.len() > 1 {
                 let paths = &file_paths;
                 let mut names = paths
@@ -92,34 +96,22 @@ impl ClipboardView {
                 None
             };
             let preview_text = file_names.unwrap_or_else(|| saved_preview.to_owned());
-            let highlights = search_highlight_ranges(&preview_text, &search)
-                .into_iter()
-                .map(|range| {
-                    (
-                        range,
-                        HighlightStyle {
-                            color: Some(cx.theme().blue),
-                            background_color: Some(cx.theme().primary.opacity(0.18)),
-                            font_weight: Some(FontWeight::SEMIBOLD),
-                            ..Default::default()
-                        },
-                    )
-                })
-                .collect::<Vec<_>>();
-            (preview_text, highlights)
+            drag_visual::CardText::searched(preview_text, search, cx)
         };
         let card = drag_visual::HistoryCardSnapshot {
             is_image,
             is_files,
-            is_pinned: item.is_pinned,
+            is_pinned: item.pinned_in(self.history.favorite_only()),
             card_index: index,
             source_app_name: item.source_app_name.clone(),
             source_app_icon: item.source_app_icon.clone(),
             display: self.display.value,
             language: self.language,
             summary,
-            preview_text,
-            highlights,
+            title,
+            is_note: note.is_some(),
+            source_match: card_note::matching_source(item, search)
+                .map(|source| drag_visual::CardText::searched(source.to_owned(), search, cx)),
             thumbnail: thumbnail_path.as_ref().and_then(|path| {
                 self.thumbnails
                     .source(&self.thumbnail_key(item, path.clone()))
@@ -185,10 +177,8 @@ impl ClipboardView {
             window,
             cx,
         );
-        // The corner is shared with the action bar; keep the title width fixed during hover.
-        let show_pin = self.batch_mode || action_opacity == 0.;
         let surface = card
-            .surface(false, show_pin, None, cx)
+            .surface(false, None, cx)
             .bg(background)
             .border_color(border);
         let measured_size = Rc::new(Cell::new(size(px(0.), px(0.))));
@@ -197,16 +187,7 @@ impl ClipboardView {
         let card_spacing = visual::card_spacing(self.display.value.card_density);
         let card_padding = visual::card_padding(self.display.value.card_density);
         let last = index + 1 == self.history.items.len();
-        let row_height = self.row_sizes.get(index).map_or_else(
-            || {
-                let mut height = px(history_row_height(item, self.display.value));
-                if last {
-                    height += px(visual::last_row_extra(self.display.value.card_density));
-                }
-                height
-            },
-            |size| size.height,
-        );
+        let row_height = self.row_sizes[index].height;
         let entity = cx.entity();
         let card_flash = self
             .copy_flash
@@ -256,7 +237,7 @@ impl ClipboardView {
                 let payload_owner = entity.clone();
                 let drag = HistoryDrag {
                     id,
-                    pinned: item.is_pinned,
+                    pinned: card.is_pinned,
                     favorite_only: self.history.favorite_only(),
                     group_id: self.history.group_id(),
                     generation: self.history.generation,
@@ -386,6 +367,49 @@ impl ClipboardView {
             .w_full()
             .h(row_height)
             .child(positioned)
+            .into_any_element()
+    }
+
+    /// Rows whose page has not arrived yet render as fixed-height placeholders.
+    /// They never carry data, so every interactive gesture naturally skips them.
+    fn render_skeleton_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let spacing = visual::card_spacing(self.display.value.card_density);
+        let padding = visual::card_padding(self.display.value.card_density);
+        let last = index + 1 == self.history.items.len();
+        let height = self
+            .row_sizes
+            .get(index)
+            .map(|size| size.height)
+            .unwrap_or_else(|| px(visual::row_height(self.display.value.card_density, 1)));
+        div()
+            .w_full()
+            .h(height)
+            .child(
+                div()
+                    .mx(px(visual::SPACE_4))
+                    .mt(px(spacing))
+                    .mb(px(if last { PAGE_PADDING } else { spacing }))
+                    .p(px(padding))
+                    .rounded(crate::card_radius::card_radius(cx))
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .flex()
+                    .items_center()
+                    .gap(px(visual::SPACE_3))
+                    .child(
+                        div()
+                            .size(px(visual::SPACE_6))
+                            .rounded(cx.theme().radius)
+                            .bg(cx.theme().muted),
+                    )
+                    .child(
+                        div()
+                            .h(px(visual::TEXT_SMALL))
+                            .w(px(160.))
+                            .rounded_full()
+                            .bg(cx.theme().muted),
+                    ),
+            )
             .into_any_element()
     }
 }

@@ -11,12 +11,14 @@ use std::{thread, time::Duration};
 
 mod appearance;
 mod capture;
+mod clearing;
 mod clipboard;
 mod data;
 mod delivery;
 mod groups;
 mod history;
 mod lifecycle;
+mod pins;
 mod preferences;
 mod preview;
 mod search;

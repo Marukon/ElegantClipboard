@@ -100,6 +100,7 @@ pub enum Command {
         category: ContentCategory,
         group_id: Option<i64>,
         limit: i64,
+        offset: i64,
         generation: u64,
     },
     PrepareExternalDrag {
@@ -184,7 +185,10 @@ pub enum Command {
         generation: u64,
     },
     ClearAllHistory,
-    TogglePin(i64),
+    TogglePin {
+        id: i64,
+        favorite_only: bool,
+    },
     ToggleFavorite(i64),
     SetFavorite {
         id: i64,
@@ -436,6 +440,9 @@ pub enum Event {
     Snapshot {
         items: Vec<ClipboardItem>,
         total: i64,
+        offset: i64,
+        structural: bool,
+        all_page: Option<(Vec<ClipboardItem>, i64)>,
         generation: u64,
     },
     Status(String),

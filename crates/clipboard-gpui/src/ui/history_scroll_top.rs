@@ -111,7 +111,7 @@ impl ClipboardView {
     ) {
         match action {
             FloatingAction::ScrollTop => self.animate_scroll_to_top(cx),
-            FloatingAction::AddTodo => self.open_todo_editor(None, String::new(), window, cx),
+            FloatingAction::AddTodo => self.open_todo_editor(None, window, cx),
         }
         cx.notify();
     }
@@ -186,7 +186,8 @@ impl ClipboardView {
                         .tooltip(label)
                         .accessibility_label(label)
                         .disabled(
-                            action == FloatingAction::AddTodo && self.todo_editor_unavailable(),
+                            action == FloatingAction::AddTodo
+                                && (self.todos_pending || self.todo_editor_unavailable()),
                         )
                         .on_click(cx.listener(
                             move |this, event, window, cx| {

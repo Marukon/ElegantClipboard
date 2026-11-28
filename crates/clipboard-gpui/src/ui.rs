@@ -13,11 +13,13 @@ mod events;
 mod external_drag;
 mod favorite_drop;
 use favorite_drop::FavoriteDropZone;
+mod card_note;
 mod file_cards;
 mod group_select;
 mod groups;
 mod history_card;
 mod history_events;
+mod history_geometry;
 mod history_list;
 mod history_scroll_top;
 mod hover_content;
@@ -78,6 +80,7 @@ mod theme_color;
 mod thumbnail_cache;
 mod todo_card;
 mod todo_drag;
+mod todo_editor;
 mod todo_layout;
 mod todo_motion;
 mod todo_notice;
@@ -92,7 +95,7 @@ mod window_show;
 pub use startup::run;
 
 use file_cards::{FileCardInfo, image_file_dimensions, image_file_record, single_file_image_path};
-use navigation::{history_row_height, history_top_row, show_history_scroll_to_top};
+use navigation::{history_top_row, show_history_scroll_to_top};
 use presentation::{
     SettingsDangerDialog, apply_theme, dialog_copy, dialog_footer, dialog_shell, dialog_title,
     format_bytes, localize_service_message, open_reset_application_dialog,
@@ -118,8 +121,7 @@ use crate::{
     options::Options,
     state::{
         HistoryReload, HistoryState, PreviewState, drag_edge_target_index, format_card_time,
-        next_drag_scroll_index, reorder_pixel_offsets, source_app_parts, source_app_visible_name,
-        toggle_batch_mark,
+        next_drag_scroll_index, source_app_parts, source_app_visible_name, toggle_batch_mark,
     },
 };
 use clipboard_core::{
@@ -262,7 +264,9 @@ enum HistoryMenuAction {
     Reveal,
     SaveAs(String),
     ToggleFavorite,
-    TogglePin,
+    TogglePin {
+        favorite_only: bool,
+    },
     MoveToGroup,
     /// 进入多选并勾选本条（非整表全选）。
     Select,
@@ -313,7 +317,9 @@ struct ClipboardView {
     selected_todo: Option<i64>,
     todos: Vec<Todo>,
     todos_pending: bool,
-    todo_draft: Option<todos::TodoDraft>,
+    todo_revision: u64,
+    memo_preview: Option<i64>,
+    todo_draft: Option<todo_editor::TodoDraft>,
     todo_edit_saving: bool,
     todo_notice: Option<todos::TodoNotice>,
     todo_layout: Rc<RefCell<todo_layout::TodoListLayout>>,
@@ -353,6 +359,7 @@ struct ClipboardView {
     editor: PreviewState,
     /// 正文编辑的独立窗口。备注仍用主窗口对话框。
     editor_window: Option<AnyWindowHandle>,
+    editor_main_level: Option<native_window::MainWindowLevel>,
     editor_input: Option<(Entity<EditorState>, Rope)>,
     editor_discard_open: bool,
     note_input: Entity<InputState>,
@@ -371,6 +378,8 @@ struct ClipboardView {
     initial_window_bounds: Option<Bounds<Pixels>>,
     thumbnails: thumbnail_cache::ThumbnailCache,
     thumbnail_scale: f32,
+    pending_pages: std::collections::HashSet<usize>,
+    paging_generation: u64,
     _thumbnail_maintenance: Task<()>,
     hover_preview: PreviewState,
     hover_popup: Option<AnyWindowHandle>,
@@ -382,7 +391,11 @@ struct ClipboardView {
     list_focus: FocusHandle,
     scroll: VirtualListScrollHandle,
     scroll_to_top_task: Option<Task<()>>,
+    scroll_to_top_generation: Option<u64>,
     scroll_top_position: history_scroll_top::ScrollTopPosition,
+    // A new query can be pending while the previous snapshot is still drawable.
+    history_search: SharedString,
+    row_search: SharedString,
     row_sizes: Rc<Vec<gpui_kit::Size<Pixels>>>,
     row_offsets: Vec<Pixels>,
     monitoring: bool,
@@ -471,7 +484,7 @@ struct ClipboardView {
     reorder_pending: bool,
     drop_target: Option<DropTarget>,
     drag_motion: DragMotionState,
-    reorder_before: Option<Vec<i64>>,
+    reorder_before: HashMap<i64, f32>,
     reorder_offsets: HashMap<i64, f32>,
     feedback_revision: usize,
     copy_flash: Option<copy_flash::CopyFlash>,
@@ -481,7 +494,7 @@ struct ClipboardView {
     external_drag: Option<external_drag::CardDragSession>,
     drag_preview_window: Option<WindowHandle<external_drag::DragPreview>>,
     drag_preparation: Option<external_drag::DragPreparation>,
-    drag_snapshot: Option<(Vec<DbClipboardItem>, i64, u64)>,
+    drag_snapshots: history_events::DeferredSnapshots,
     drag_deleted_ids: HashSet<i64>,
     drag_viewport: Rc<Cell<Option<Bounds<Pixels>>>>,
     favorite_drop: Rc<FavoriteDropZone>,

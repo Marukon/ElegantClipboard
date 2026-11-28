@@ -170,7 +170,7 @@ impl OnboardingFavorites {
                 });
                 cx.new(|_| preview)
             })
-            .child(self.sample.surface(false, false, None, cx))
+            .child(self.sample.surface(false, None, cx))
             .child(
                 canvas(
                     move |bounds, _, _| dimensions.set(bounds.size),
@@ -311,7 +311,7 @@ impl Render for FavoritePreview {
         div()
             .w(self.dimensions.width)
             .h(self.dimensions.height)
-            .child(self.sample.surface(true, false, hint, cx))
+            .child(self.sample.surface(true, hint, cx))
     }
 }
 
@@ -330,13 +330,13 @@ fn demo_card(language: LanguagePreference) -> Rc<HistoryCardSnapshot> {
         },
         language,
         summary: tr(language, "示例记录 · 文字", "Demo record · Text").into(),
-        preview_text: tr(
+        title: super::drag_visual::CardText::plain(tr(
             language,
             "项目灵感：整理常用链接",
             "Project ideas: collect useful links.",
-        )
-        .into(),
-        highlights: Vec::new(),
+        )),
+        is_note: false,
+        source_match: None,
         thumbnail_path: None,
         thumbnail: None,
         file_warning: false,

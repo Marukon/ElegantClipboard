@@ -165,8 +165,11 @@ impl ClipboardView {
     pub(super) fn refresh_file_card_info(&mut self, cx: &mut Context<Self>) {
         let loaded_paths: HashMap<_, _> = self
             .history
-            .items
-            .iter()
+            .parked_all_items()
+            .into_iter()
+            .flat_map(|items| items.loaded())
+            .chain(self.history.items.loaded())
+            .map(|(_, item)| item)
             .filter(|item| item.content_type == "files")
             .map(|item| (item.id, item.file_paths.as_deref().unwrap_or_default()))
             .collect();
@@ -177,7 +180,8 @@ impl ClipboardView {
         let candidates: Vec<_> = self
             .history
             .items
-            .iter()
+            .loaded()
+            .map(|(_, item)| item)
             .filter(|item| {
                 item.content_type == "files" && !self.file_card_checked.contains_key(&item.id)
             })

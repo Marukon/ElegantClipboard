@@ -1,9 +1,10 @@
 use super::editor_window::{
     CONTEXT, CancelContentEditor, SaveContentEditor, editor_title, markdown_preview_source,
-    memo_kind_toggle, request_standalone_editor_close, save_shortcut_label,
+    request_standalone_editor_close, save_shortcut_label,
 };
+use super::todo_editor::{TodoDraft, memo_kind_toggle};
 use super::*;
-use gpui_kit::component::input::{Editor, EditorState, Escape as EditorEscape};
+use gpui_kit::component::input::{Editor, EditorState, Escape as EditorEscape, InputContent};
 use gpui_kit::component::text::TextView;
 
 pub(super) struct ContentEditorWindow {
@@ -17,11 +18,13 @@ pub(super) struct ContentEditorWindow {
     _owner_subscription: Subscription,
     _owner_release_subscription: Subscription,
     _editor_subscription: Subscription,
+    _activation: Subscription,
 }
 
 impl ContentEditorWindow {
     pub(super) fn new(
         owner: WeakEntity<ClipboardView>,
+        memo_source: Option<SharedString>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -32,18 +35,41 @@ impl ContentEditorWindow {
         let subscription = cx.observe_in(&entity, window, |this, owner, window, cx| {
             let owner = owner.read(cx);
             let language = owner.language;
-            let adding_todo = owner.todo_draft.as_ref().map(|draft| draft.id.is_none());
-            if language != this.language || adding_todo.is_some() {
+            if language != this.language {
                 this.language = language;
-                window.set_window_title(editor_title(language, adding_todo));
+                window.set_window_title(editor_title(language, owner.todo_draft));
             }
             cx.notify();
         });
         let release_subscription = cx.observe_release(&entity, |_, _, cx| cx.notify());
         let editor = cx.new(|cx| EditorState::new(window, cx).line_number(true));
         let editor_subscription = cx.observe(&editor, |_, _, cx| cx.notify());
+        // The panel can be summoned above another app while this editor is
+        // minimized. Yield the panel again if the user restores the editor.
+        let activation = cx.observe_window_activation(window, |this, editor, cx| {
+            if !editor.is_window_active() || native_window::is_window_minimized(editor) {
+                return;
+            }
+            let _ = this.owner.update(cx, |view, cx| {
+                if view.editor_main_level.is_none()
+                    && view.editor_window == Some(editor.window_handle())
+                {
+                    let _ = view.main_window.update(cx, |_, main, _| {
+                        if native_window::is_window_shown(main)
+                            && !native_window::is_window_minimized(main)
+                        {
+                            view.lower_main_for_editor(main);
+                        }
+                    });
+                    if view.editor_main_level.is_some() {
+                        // Removing TOPMOST can put the panel first in the normal band.
+                        native_window::raise_front(editor);
+                    }
+                }
+            });
+        });
         window_lifecycle::bind_satellite_release(owner.clone(), window, cx);
-        Self {
+        let mut editor_window = Self {
             owner,
             editor,
             language,
@@ -53,10 +79,20 @@ impl ContentEditorWindow {
             _owner_subscription: subscription,
             _owner_release_subscription: release_subscription,
             _editor_subscription: editor_subscription,
+            _activation: activation,
+        };
+        if let Some(source) = memo_source {
+            editor_window.load_text(source, window, cx);
         }
+        editor_window
     }
 
-    fn load_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn load_text(
+        &mut self,
+        text: impl Into<InputContent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.loaded {
             return;
         }
@@ -100,8 +136,8 @@ impl ContentEditorWindow {
 
     fn title_bar(
         &self,
-        adding_todo: Option<bool>,
         language: LanguagePreference,
+        memo: Option<TodoDraft>,
         cx: &mut Context<Self>,
     ) -> TitleBar {
         let pinned = self.pinned;
@@ -127,7 +163,7 @@ impl ContentEditorWindow {
                         .text_size(cx.theme().font_size)
                         .font_family(cx.theme().font_family.clone())
                         .font_medium()
-                        .child(editor_title(language, adding_todo)),
+                        .child(editor_title(language, memo)),
                 )
                 .child(
                     div()
@@ -178,33 +214,16 @@ impl Render for ContentEditorWindow {
         let Some(owner) = self.owner.upgrade() else {
             return unavailable_editor(self.language, cx);
         };
-        let (
-            language,
-            pending,
-            memo_busy,
-            ready,
-            loading,
-            rich,
-            adding_todo,
-            memo_kind,
-            error,
-            initial_text,
-        ) = {
+        let (language, pending, memo, memo_busy, ready, loading, rich, error, initial_text) = {
             let view = owner.read(cx);
-            let editing_todo = view.todo_draft.is_some();
-            let memo_kind = view.todo_draft.as_ref().map(|draft| draft.kind);
-            let adding_todo = view.todo_draft.as_ref().map(|draft| draft.id.is_none());
-            let initial_text = if self.loaded {
-                None
-            } else if let Some(draft) = &view.todo_draft {
-                Some(draft.text.clone())
-            } else {
-                match view.editor.result.as_ref() {
-                    Some(Ok(PreviewContent::Text(text) | PreviewContent::RichText(text))) => {
-                        Some(text.clone())
-                    }
-                    _ => None,
+            let memo = view.todo_draft;
+            let initial_text = match view.editor.result.as_ref() {
+                Some(Ok(PreviewContent::Text(text) | PreviewContent::RichText(text)))
+                    if !self.loaded =>
+                {
+                    Some(text.clone())
                 }
+                _ => None,
             };
             let error = view.editor_error.clone().or_else(|| {
                 view.editor
@@ -215,17 +234,15 @@ impl Render for ContentEditorWindow {
             (
                 view.language,
                 view.editor_pending() || view.todo_edit_saving,
-                editing_todo && view.todos_pending,
-                editing_todo
+                memo,
+                memo.is_some() && view.todos_pending,
+                memo.is_some()
                     || matches!(
                         view.editor.result,
                         Some(Ok(PreviewContent::Text(_) | PreviewContent::RichText(_)))
                     ),
-                !editing_todo && view.editor.result.is_none(),
-                !editing_todo
-                    && matches!(view.editor.result, Some(Ok(PreviewContent::RichText(_)))),
-                adding_todo,
-                memo_kind,
+                memo.is_none() && view.editor.result.is_none(),
+                matches!(view.editor.result, Some(Ok(PreviewContent::RichText(_)))),
                 error,
                 initial_text,
             )
@@ -235,6 +252,10 @@ impl Render for ContentEditorWindow {
         }
         self.language = language;
         let editable = self.loaded && ready && !pending;
+        let new_kind = match memo {
+            Some(TodoDraft::New(kind)) => Some(kind),
+            _ => None,
+        };
         let this = cx.weak_entity();
         let cancel = this.clone();
         let save = this.clone();
@@ -248,7 +269,7 @@ impl Render for ContentEditorWindow {
                 this.cancel(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SaveContentEditor, _, cx| this.save(cx)))
-            .child(self.title_bar(adding_todo, language, cx))
+            .child(self.title_bar(language, memo, cx))
             .child(
                 div()
                     .flex_1()
@@ -273,9 +294,12 @@ impl Render for ContentEditorWindow {
                             },
                         )
                         .when(self.markdown_preview, |area| {
-                            let preview = markdown_preview_source(
-                                self.editor.read(cx).value().as_ref(),
-                            );
+                            let source = self.editor.read(cx).value();
+                            let preview = if memo.is_some() {
+                                source
+                            } else {
+                                markdown_preview_source(source.as_ref()).into()
+                            };
                             area.child(
                                 div().size_full().overflow_y_scrollbar().child(
                                     div()
@@ -332,20 +356,21 @@ impl Render for ContentEditorWindow {
             .child(
                 div()
                     .flex()
-                    .justify_between()
+                    .justify_end()
                     .items_center()
                     .flex_shrink_0()
                     .px(px(visual::SPACE_4))
                     .py(px(visual::SPACE_3))
                     .border_t_1()
                     .border_color(cx.theme().border)
-                    .child(memo_kind_toggle(
-                        adding_todo == Some(true),
-                        memo_kind,
-                        language,
-                        self.owner.clone(),
-                        pending,
-                    ))
+                    .when_some(new_kind, |footer, kind| {
+                        footer.justify_between().child(memo_kind_toggle(
+                            kind,
+                            language,
+                            self.owner.clone(),
+                            pending,
+                        ))
+                    })
                     .child(
                         div()
                             .flex()
@@ -379,13 +404,13 @@ impl Render for ContentEditorWindow {
     }
 }
 
-fn editor_title_bar(language: LanguagePreference, adding_todo: Option<bool>, cx: &App) -> TitleBar {
+fn editor_title_bar(language: LanguagePreference, cx: &App) -> TitleBar {
     TitleBar::new().bg(cx.theme().sidebar).child(
         div()
             .text_size(cx.theme().font_size)
             .font_family(cx.theme().font_family.clone())
             .font_medium()
-            .child(editor_title(language, adding_todo)),
+            .child(editor_title(language, None)),
     )
 }
 
@@ -412,7 +437,7 @@ fn editor_title_button(
 
 fn unavailable_editor(language: LanguagePreference, cx: &mut App) -> Div {
     window_shell(cx)
-        .child(editor_title_bar(language, None, cx))
+        .child(editor_title_bar(language, cx))
         .child(
             div().p(px(visual::SPACE_3)).child(
                 Alert::error(

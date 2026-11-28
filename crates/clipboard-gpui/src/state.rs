@@ -7,6 +7,9 @@ use clipboard_core::{
 use indexmap::IndexSet;
 use std::collections::HashMap;
 
+mod items;
+pub use items::HistoryItems;
+
 /// Return whether to show the name and icon; icon-only falls back to the name.
 pub fn source_app_parts(mode: SourceAppDisplay, has_icon: bool) -> (bool, bool) {
     match mode {
@@ -90,17 +93,19 @@ pub fn format_card_time(
 /// Append newly marked rows in click order, or from the anchor toward the Shift-click.
 pub(crate) fn toggle_batch_mark(
     selected: &mut IndexSet<i64>,
-    items: &[ClipboardItem],
+    items: &HistoryItems,
     anchor: Option<i64>,
     target: i64,
 ) -> bool {
-    let Some(to) = items.iter().position(|item| item.id == target) else {
+    let Some(to) = items.known_index(target) else {
         return false;
     };
-    if let Some(from) = anchor.and_then(|id| items.iter().position(|item| item.id == id)) {
-        let range = items[from.min(to)..=from.max(to)]
+    if let Some(from) = anchor.and_then(|id| items.known_index(id)) {
+        // Evicting metadata doesn't unmark IDs from a previously visited page.
+        let range = items.ids[from.min(to)..=from.max(to)]
             .iter()
-            .map(|item| item.id);
+            .flatten()
+            .copied();
         if from <= to {
             selected.extend(range);
         } else {
@@ -210,33 +215,58 @@ enum HistoryFilter {
     Category(ContentCategory),
 }
 
+/// Leave All drawable during the outbound query. Only move its storage out
+/// when the first Favorites reply actually replaces the displayed rows.
+enum ParkedAll {
+    OnScreen,
+    OffScreen(HistoryItems),
+}
+
 /// View state kept independent of GPUI so asynchronous ordering can be tested.
+///
+/// The full filtered order is addressable while only a window of metadata
+/// remains resident. Old rows stay drawable until a new view's first reply.
 pub struct HistoryState {
-    pub items: Vec<ClipboardItem>,
+    pub items: HistoryItems,
     pub total: i64,
     pub generation: u64,
     pub selected: Option<i64>,
     pub loading: bool,
     filter: HistoryFilter,
     group_id: Option<i64>,
+    parked_all: Option<ParkedAll>,
+    // The return query still has to synchronize the worker's scope and order.
+    // Until it replies, the restored rows may be parked again but not paged.
+    restored_all: bool,
+    // The generation whose replies most recently wrote into the slots. A new
+    // view's first page resets the slots: positions in the previous view are
+    // unrelated, and a merge would pair the wrong rows with their indexes.
+    slots_generation: Option<u64>,
+    // Last row the keyboard reached, loaded or not. Slots never move inside a
+    // view, so the index stays valid while pages stream in around it.
+    navigation_index: Option<usize>,
 }
 
 impl Default for HistoryState {
     fn default() -> Self {
         Self {
-            items: Vec::new(),
+            items: HistoryItems::default(),
             total: 0,
             generation: 0,
             selected: None,
             loading: true,
             filter: HistoryFilter::All,
             group_id: None,
+            parked_all: None,
+            restored_all: false,
+            slots_generation: None,
+            navigation_index: None,
         }
     }
 }
 
-/// A history generation that is loading and still needs `Command::Query`.
-#[must_use = "arm a history query or the list stays loading"]
+/// A new worker scope that still needs `Command::Query`, even if already drawable.
+#[must_use = "arm a history query to synchronize the worker's scope"]
 pub struct HistoryReload {
     generation: u64,
 }
@@ -248,6 +278,16 @@ impl HistoryReload {
 }
 
 impl HistoryState {
+    pub fn item_index(&self, id: i64) -> Option<usize> {
+        self.items
+            .loaded()
+            .find_map(|(i, row)| (row.id == id).then_some(i))
+    }
+
+    pub fn can_page(&self) -> bool {
+        !self.loading && self.slots_generation == Some(self.generation)
+    }
+
     pub fn favorite_only(&self) -> bool {
         matches!(self.filter, HistoryFilter::Favorites)
     }
@@ -263,16 +303,84 @@ impl HistoryState {
         self.group_id
     }
 
+    pub(crate) fn parked_all_items(&self) -> Option<&HistoryItems> {
+        match self.parked_all.as_ref()? {
+            ParkedAll::OnScreen => Some(&self.items),
+            ParkedAll::OffScreen(items) => Some(items),
+        }
+    }
+
+    /// A companion page read in the same worker scope as Favorites. Its order
+    /// is authoritative for All; never merge it with positions from a prior read.
+    pub(crate) fn remember_all_page(
+        &mut self,
+        items: Vec<ClipboardItem>,
+        total: i64,
+        generation: u64,
+    ) {
+        if generation != self.generation || !self.favorite_only() {
+            return;
+        }
+        let mut all = match self.parked_all.take() {
+            Some(ParkedAll::OffScreen(items)) => items,
+            _ => HistoryItems::default(),
+        };
+        all.watch(0..1);
+        all.merge(items, usize::try_from(total).unwrap_or(0), 0, true, true);
+        self.parked_all = Some(ParkedAll::OffScreen(all));
+    }
+
+    /// An effective search change (including the locate override) invalidates
+    /// All even when its unchanged tab and group would otherwise match.
+    pub(crate) fn invalidate_all_view(&mut self) {
+        self.parked_all = None;
+        self.restored_all = false;
+        if self.filter == HistoryFilter::All {
+            self.slots_generation = None;
+        }
+    }
+
     /// `None` leaves generation and any in-flight snapshot untouched.
     fn set_filter(&mut self, filter: HistoryFilter) -> Option<HistoryReload> {
         if self.filter == filter {
             return None;
         }
+        let parked = match (self.filter, filter) {
+            (HistoryFilter::All, HistoryFilter::Favorites)
+                if (self.can_page() || self.restored_all)
+                    && (self.items.is_empty() || self.items[0].is_some()) =>
+            {
+                Some(ParkedAll::OnScreen)
+            }
+            (HistoryFilter::Favorites, HistoryFilter::All)
+                if self
+                    .parked_all_items()
+                    .is_some_and(|items| items.is_empty() || items[0].is_some()) =>
+            {
+                self.parked_all.take()
+            }
+            _ => None,
+        };
         self.filter = filter;
-        Some(self.begin_search())
+        let reload = self.begin_search();
+        if let Some(parked) = parked {
+            if filter == HistoryFilter::Favorites {
+                self.parked_all = Some(parked);
+            } else {
+                if let ParkedAll::OffScreen(items) = parked {
+                    self.items = items;
+                }
+                self.items.watch(0..1);
+                self.total = self.items.len() as i64;
+                self.selected = self.items.id_at(0);
+                self.loading = false;
+                self.restored_all = true;
+            }
+        }
+        Some(reload)
     }
 
-    #[must_use = "arm a history query or the list stays loading"]
+    #[must_use = "arm the history query to synchronize the worker's scope"]
     pub fn set_favorite_filter(&mut self, favorite_only: bool) -> Option<HistoryReload> {
         self.set_filter(if favorite_only {
             HistoryFilter::Favorites
@@ -281,7 +389,7 @@ impl HistoryState {
         })
     }
 
-    #[must_use = "arm a history query or the list stays loading"]
+    #[must_use = "arm the history query to synchronize the worker's scope"]
     pub fn set_category(&mut self, category: ContentCategory) -> Option<HistoryReload> {
         self.set_filter(match category {
             ContentCategory::All => HistoryFilter::All,
@@ -305,38 +413,93 @@ impl HistoryState {
         self.begin_search()
     }
 
-    #[must_use = "arm a history query or the list stays loading"]
+    /// Rows stay in place while the replacement is in flight: the previous
+    /// view's data remains visible until the new snapshot swaps it atomically,
+    /// so switching scopes never blanks the list.
     pub fn begin_search(&mut self) -> HistoryReload {
+        self.parked_all = None;
+        self.restored_all = false;
         self.generation += 1;
         self.loading = true;
-        self.items.clear();
         self.selected = None;
-        self.total = 0;
+        self.navigation_index = None;
         HistoryReload {
             generation: self.generation,
         }
     }
 
-    pub fn apply(&mut self, items: Vec<ClipboardItem>, total: i64, generation: u64) -> bool {
+    /// Merge one paged snapshot into the sparse slots. `structural` snapshots
+    /// follow mutations and captures: the worker re-reads the authoritative
+    /// order, so every slot outside the page may have shifted and is dropped.
+    /// Query answers only page in data and merge into the surviving slots.
+    pub fn apply(
+        &mut self,
+        items: Vec<ClipboardItem>,
+        total: i64,
+        offset: usize,
+        structural: bool,
+        generation: u64,
+    ) -> bool {
         if generation != self.generation {
             return false;
         }
-        if !items.iter().any(|item| Some(item.id) == self.selected) {
-            self.selected = items.first().map(|item| item.id);
+        if structural {
+            // A filtered mutation reply says nothing about All's new order.
+            self.parked_all = None;
+        } else if matches!(self.parked_all, Some(ParkedAll::OnScreen)) {
+            self.parked_all = Some(ParkedAll::OffScreen(std::mem::take(&mut self.items)));
         }
-        self.items = items;
+        self.restored_all = false;
+        let total_len = usize::try_from(total).unwrap_or(0);
+        let new_view = self.slots_generation != Some(generation);
+        if new_view {
+            self.items.watch(offset..offset.saturating_add(1));
+        } else if !structural && !self.items.wants_page(offset) {
+            return false;
+        }
+        self.slots_generation = Some(generation);
+        self.items.merge(
+            items,
+            total_len,
+            offset,
+            structural || new_view,
+            self.filter == HistoryFilter::All,
+        );
+        if self
+            .selected
+            .is_none_or(|id| self.items.known_index(id).is_none())
+        {
+            self.selected = match self.navigation_index {
+                Some(i) if !structural && !new_view => self.items.id_at(i),
+                _ => self
+                    .items
+                    .id_at(offset)
+                    .or_else(|| self.items.known_ids().next()),
+            };
+        }
         self.total = total;
         self.loading = false;
         true
     }
-
     /// Reconcile a committed deletion without completing an in-flight query.
     pub fn apply_deleted(&mut self, id: i64) -> bool {
-        if !remove_deleted_item(&mut self.items, &mut self.total, id) {
+        // Return whether the *displayed* rows changed. A delete can affect
+        // only parked All; if its position is unknown, don't restore its slots.
+        let removed = self.items.remove(id);
+        let parked_valid = match self.parked_all.as_mut() {
+            None => true,
+            Some(ParkedAll::OnScreen) => removed || !self.items.ids.contains(&None),
+            Some(ParkedAll::OffScreen(items)) => items.remove(id) || !items.ids.contains(&None),
+        };
+        if !parked_valid {
+            self.parked_all = None;
+        }
+        if !removed {
             return false;
         }
+        self.total = self.total.saturating_sub(1).max(0);
         if self.selected == Some(id) {
-            self.selected = self.items.first().map(|item| item.id);
+            self.selected = self.items.known_ids().next();
         }
         true
     }
@@ -350,38 +513,28 @@ impl HistoryState {
     }
 
     pub fn select_relative(&mut self, direction: isize) -> Option<usize> {
-        if self.items.is_empty() {
+        let len = self.items.len();
+        if len == 0 {
             self.selected = None;
             return None;
         }
         let current = self
-            .items
-            .iter()
-            .position(|item| Some(item.id) == self.selected)
+            .selected
+            .and_then(|id| self.items.known_index(id))
+            .or(self.navigation_index)
             .unwrap_or(0);
-        let next = current
-            .saturating_add_signed(direction)
-            .min(self.items.len() - 1);
-        self.selected = Some(self.items[next].id);
-        Some(next)
+        let index = current.saturating_add_signed(direction).min(len - 1);
+        self.navigation_index = Some(index);
+        self.selected = self.items.id_at(index);
+        Some(index)
     }
 
     pub fn select_index(&mut self, index: usize) -> Option<usize> {
         let index = index.min(self.items.len().checked_sub(1)?);
-        self.selected = Some(self.items[index].id);
+        self.navigation_index = Some(index);
+        self.selected = self.items.id_at(index);
         Some(index)
     }
-}
-
-/// Remove only a loaded ID: an absent ID may belong to another filter or an
-/// already refreshed snapshot, whose total must not be decremented again.
-pub fn remove_deleted_item(items: &mut Vec<ClipboardItem>, total: &mut i64, id: i64) -> bool {
-    let Some(index) = items.iter().position(|item| item.id == id) else {
-        return false;
-    };
-    items.remove(index);
-    *total = total.saturating_sub(1).max(0);
-    true
 }
 
 #[cfg(test)]
@@ -391,5 +544,7 @@ fn settle(reload: impl Sized) {
 
 #[cfg(test)]
 mod deletion_tests;
+#[cfg(test)]
+mod paging_tests;
 #[cfg(test)]
 mod tests;

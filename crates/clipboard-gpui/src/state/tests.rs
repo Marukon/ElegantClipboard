@@ -76,25 +76,27 @@ fn sequence_selection_keeps_click_order_and_appends_shift_ranges() -> anyhow::Re
         history.capture(text)?;
     }
     let rows = history.list("", PAGE_SIZE, false)?;
+    let mut items = HistoryItems::default();
+    items.merge(rows.clone(), rows.len(), 0, true, false);
     let [first, second, third, last] = rows.as_slice() else {
         panic!("expected four history rows");
     };
     let mut selected = IndexSet::new();
 
     for id in [last.id, first.id, second.id] {
-        assert!(toggle_batch_mark(&mut selected, &rows, None, id));
+        assert!(toggle_batch_mark(&mut selected, &items, None, id));
     }
     assert!(selected.iter().copied().eq([last.id, first.id, second.id]));
 
     // Rechecking the first mark puts it last without moving the other two.
-    toggle_batch_mark(&mut selected, &rows, None, last.id);
-    toggle_batch_mark(&mut selected, &rows, None, last.id);
+    toggle_batch_mark(&mut selected, &items, None, last.id);
+    toggle_batch_mark(&mut selected, &items, None, last.id);
     assert!(selected.iter().copied().eq([first.id, second.id, last.id]));
 
     selected.clear();
-    toggle_batch_mark(&mut selected, &rows, None, last.id);
-    toggle_batch_mark(&mut selected, &rows, None, second.id);
-    toggle_batch_mark(&mut selected, &rows, Some(last.id), first.id);
+    toggle_batch_mark(&mut selected, &items, None, last.id);
+    toggle_batch_mark(&mut selected, &items, None, second.id);
+    toggle_batch_mark(&mut selected, &items, Some(last.id), first.id);
     assert!(
         selected
             .iter()
@@ -103,14 +105,14 @@ fn sequence_selection_keeps_click_order_and_appends_shift_ranges() -> anyhow::Re
     );
 
     selected.clear();
-    toggle_batch_mark(&mut selected, &rows, Some(i64::MAX), second.id);
+    toggle_batch_mark(&mut selected, &items, Some(i64::MAX), second.id);
     assert!(!toggle_batch_mark(
         &mut selected,
-        &rows,
+        &items,
         Some(second.id),
         i64::MAX
     ));
-    toggle_batch_mark(&mut selected, &rows, Some(second.id), last.id);
+    toggle_batch_mark(&mut selected, &items, Some(second.id), last.id);
     assert!(selected.iter().copied().eq([second.id, third.id, last.id]));
     Ok(())
 }
@@ -151,8 +153,8 @@ fn unchanged_scope_keeps_the_in_flight_generation() {
     assert!(state.set_group(Some(9)).is_none());
     assert_eq!(state.generation, generation);
     assert!(state.loading);
-    assert!(!state.apply(vec![], 0, generation - 1));
-    assert!(state.apply(vec![], 0, generation));
+    assert!(!state.apply(vec![], 0, 0, true, generation - 1));
+    assert!(state.apply(vec![], 0, 0, true, generation));
     assert!(!state.loading);
 
     assert!(state.set_category(ContentCategory::Text).is_some());
@@ -160,7 +162,7 @@ fn unchanged_scope_keeps_the_in_flight_generation() {
     assert!(state.set_category(ContentCategory::Text).is_none());
     assert_eq!(state.generation, generation);
     assert!(state.loading);
-    assert!(state.apply(vec![], 0, generation));
+    assert!(state.apply(vec![], 0, 0, true, generation));
 
     assert!(state.set_favorite_filter(true).is_some());
     assert!(state.favorite_only());
@@ -184,17 +186,17 @@ fn filter_change_rejects_previous_results() {
     super::settle(state.set_favorite_filter(true));
     assert!(state.favorite_only());
     assert_eq!(state.selected, None);
-    assert!(!state.apply(vec![], 100, old));
+    assert!(!state.apply(vec![], 100, 0, true, old));
     super::settle(state.begin_search());
     assert!(state.favorite_only());
-    assert!(state.apply(vec![], 0, state.generation));
+    assert!(state.apply(vec![], 0, 0, true, state.generation));
     super::settle(state.set_favorite_filter(false));
     assert!(!state.favorite_only());
     assert!(state.loading);
     let old = state.generation;
     super::settle(state.set_group(Some(7)));
     assert_eq!(state.group_id(), Some(7));
-    assert!(!state.apply(vec![], 1, old));
+    assert!(!state.apply(vec![], 1, 0, true, old));
     assert!(!state.fail_query(old));
     assert!(state.loading);
     assert!(state.fail_query(state.generation));
@@ -205,7 +207,7 @@ fn filter_change_rejects_previous_results() {
     super::settle(state.set_category(ContentCategory::Other));
     assert_eq!(state.category(), ContentCategory::Other);
     assert!(!state.favorite_only());
-    assert!(!state.apply(vec![], 0, old));
+    assert!(!state.apply(vec![], 0, 0, true, old));
     super::settle(state.set_favorite_filter(true));
     assert_eq!(state.category(), ContentCategory::All);
     assert!(state.favorite_only());
@@ -217,7 +219,7 @@ fn filter_change_rejects_previous_results() {
     assert_eq!(state.group_id(), None);
     assert!(!state.favorite_only());
     assert_eq!(state.category(), ContentCategory::All);
-    assert!(!state.apply(vec![], 100, old));
+    assert!(!state.apply(vec![], 100, 0, true, old));
 }
 
 #[test]
@@ -231,7 +233,7 @@ fn category_and_favorite_filters_preserve_group_selection() -> anyhow::Result<()
     let mut state = HistoryState::default();
 
     super::settle(state.set_group(Some(group.id)));
-    assert!(state.apply(items, 1, state.generation));
+    assert!(state.apply(items, 1, 0, true, state.generation));
     assert_eq!(state.select_index(0), Some(0));
     assert_eq!(state.selected, Some(id));
     assert_eq!(state.group_id(), Some(group.id));
@@ -307,7 +309,7 @@ fn group_tabs_and_search_compose_without_leaking_rows_or_selection() -> anyhow::
         actual.sort_unstable();
         assert_eq!(actual, expected);
         assert_eq!(count, expected.len() as i64);
-        assert!(state.apply(rows, count, state.generation));
+        assert!(state.apply(rows, count, 0, true, state.generation));
         assert!(state.selected.is_none_or(|id| expected.contains(&id)));
         Ok(())
     };
@@ -316,12 +318,13 @@ fn group_tabs_and_search_compose_without_leaking_rows_or_selection() -> anyhow::
     super::settle(state.set_category(ContentCategory::Text));
     super::settle(state.set_group(Some(first)));
     query(&mut state, "needle", &ids[1..2])?;
-    let stale_rows = state.items.clone();
+    let stale_rows = state.items.loaded().map(|(_, row)| row.clone()).collect();
     let stale_generation = state.generation;
     super::settle(state.set_group(Some(second)));
     assert_eq!(state.selected, None);
-    assert!(state.items.is_empty());
-    assert!(!state.apply(stale_rows, 1, stale_generation));
+    // Rows of the previous group stay visible until the new snapshot swaps them.
+    assert!(!state.items.is_empty());
+    assert!(!state.apply(stale_rows, 1, 0, true, stale_generation));
     assert!(!state.fail_query(stale_generation));
     query(&mut state, "needle", &ids[4..5])?;
     super::settle(state.set_category(ContentCategory::Other));
@@ -366,10 +369,10 @@ fn late_search_results_are_rejected_and_selection_follows_ids() -> anyhow::Resul
     let a = history.capture("alpha")?.unwrap();
     let b = history.capture("beta")?.unwrap();
     let mut state = HistoryState::default();
-    state.apply(history.list("", PAGE_SIZE, false)?, 2, 0);
+    state.apply(history.list("", PAGE_SIZE, false)?, 2, 0, true, 0);
     state.selected = Some(a);
     history.capture("alpha")?;
-    state.apply(history.list("", PAGE_SIZE, false)?, 2, 0);
+    state.apply(history.list("", PAGE_SIZE, false)?, 2, 0, true, 0);
     assert_eq!(state.selected, Some(a));
     assert_eq!(state.select_relative(1), Some(1));
     assert_eq!(state.selected, Some(b));
@@ -381,12 +384,13 @@ fn late_search_results_are_rejected_and_selection_follows_ids() -> anyhow::Resul
     assert_eq!(state.select_index(0), Some(0));
     assert_eq!(state.selected, Some(a));
     super::settle(state.begin_search());
-    assert!(!state.apply(history.list("", PAGE_SIZE, false)?, 2, 0));
-    assert!(state.items.is_empty());
-    assert!(state.apply(history.list("beta", PAGE_SIZE, false)?, 1, 1));
+    assert!(!state.apply(history.list("", PAGE_SIZE, false)?, 2, 0, true, 0));
+    // A pending reload keeps the stale rows instead of blanking the list.
+    assert!(!state.items.is_empty());
+    assert!(state.apply(history.list("beta", PAGE_SIZE, false)?, 1, 0, true, 1));
     assert_eq!(state.selected, Some(b));
     history.delete(b)?;
-    state.apply(vec![], 0, 1);
+    state.apply(vec![], 0, 0, true, 1);
     assert_eq!(state.select_relative(1), None);
     assert_eq!(state.select_index(0), None);
     assert_eq!(state.selected, None);

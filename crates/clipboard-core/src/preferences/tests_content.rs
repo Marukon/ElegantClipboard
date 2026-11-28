@@ -107,6 +107,7 @@ fn display_preferences_survive_restart_and_recover_invalid_values() -> Result<()
         },
         card_density: CardDensity::Compact,
         card_max_lines: 5,
+        pin_marker_style: PinMarkerStyle::FoldedCorner,
         show_time: false,
         time_format: TimeFormat::Relative,
         show_char_count: false,
@@ -140,6 +141,7 @@ fn display_preferences_survive_restart_and_recover_invalid_values() -> Result<()
         preferences.display()?,
         DisplayPreference {
             card_density: CardDensity::Compact,
+            pin_marker_style: PinMarkerStyle::Swallowtail,
             ..DisplayPreference::default()
         }
     );

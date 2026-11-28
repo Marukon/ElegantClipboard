@@ -37,59 +37,48 @@ impl ClipboardView {
             window.scale_factor(),
             window.display(cx).map(|display| display.id()),
         );
-        let (source_bounds, image_dimensions, information) = if self.todos_open {
-            let Some(prepared) = memo_hover_source(self, id, owner_bounds) else {
-                return;
-            };
-            prepared
-        } else {
-            let Some(index) = self.history.items.iter().position(|item| item.id == id) else {
-                return;
-            };
-            let item = &self.history.items[index];
-            let image_path = match &result {
-                Ok(PreviewContent::Image(path)) => Some(path.clone()),
-                Ok(PreviewContent::Files(entries)) => single_file_image_path(entries),
-                _ => None,
-            };
-            let image_dimensions = image_path.as_deref().and_then(|path| {
-                item.image_width
-                    .zip(item.image_height)
-                    .or_else(|| image_file_dimensions(path))
-            });
-            let (Some(viewport), Some(row_offset)) =
-                (self.drag_viewport.get(), self.row_offsets.get(index))
-            else {
-                return;
-            };
-            let spacing = px(visual::card_spacing(self.display.value.card_density));
-            let top = viewport.top() + *row_offset + self.scroll.offset().y + spacing;
-            let bottom = top + px(history_row_height(item, self.display.value)) - spacing * 2.;
-            let visible_top = top.max(viewport.top());
-            let visible_bottom = bottom.min(viewport.bottom());
-            if visible_bottom <= visible_top {
-                return;
-            }
-            let source_bounds = Bounds::new(
-                point(
-                    owner_bounds.left() + px(PAGE_PADDING),
-                    owner_bounds.top() + visible_top,
-                ),
-                size(
-                    owner_bounds.size.width - px(PAGE_PADDING * 2.),
-                    visible_bottom - visible_top,
-                ),
-            );
-            (
-                source_bounds,
-                image_dimensions,
-                hover_information::HoverInformation::new(
-                    item,
-                    image_dimensions,
-                    self.hover_preference.value.details,
-                ),
-            )
+        let Some(index) = self.history.item_index(id) else {
+            return;
         };
+        let Some(item) = self.history.items[index].as_ref() else {
+            return;
+        };
+        let image_path = match &result {
+            Ok(PreviewContent::Image(path)) => Some(path.clone()),
+            Ok(PreviewContent::Files(entries)) => single_file_image_path(entries),
+            _ => None,
+        };
+        let image_dimensions = image_path.as_deref().and_then(|path| {
+            item.image_width
+                .zip(item.image_height)
+                .or_else(|| image_file_dimensions(path))
+        });
+        let (Some(viewport), Some(row)) = (self.drag_viewport.get(), self.history_hover_row(index))
+        else {
+            return;
+        };
+        let spacing = px(visual::card_spacing(self.display.value.card_density));
+        let origin = viewport.top() + self.scroll.offset().y;
+        let visible_top = (origin + row.start + spacing).max(viewport.top());
+        let visible_bottom = (origin + row.end - spacing).min(viewport.bottom());
+        if visible_bottom <= visible_top {
+            return;
+        }
+        let source_bounds = Bounds::new(
+            point(
+                owner_bounds.left() + px(PAGE_PADDING),
+                owner_bounds.top() + visible_top,
+            ),
+            size(
+                owner_bounds.size.width - px(PAGE_PADDING * 2.),
+                visible_bottom - visible_top,
+            ),
+        );
+        let information = hover_information::HoverInformation::new(
+            item,
+            image_dimensions,
+            self.hover_preference.value.details,
+        );
         let anchor_y = owner_bounds.top() + window.mouse_position().y;
         let Some(bounds) = crate::popup_geometry::hover_popup_bounds(
             owner_bounds,
@@ -196,51 +185,6 @@ impl ClipboardView {
             });
         }
     }
-}
-
-type HoverSource = (
-    Bounds<Pixels>,
-    Option<(i64, i64)>,
-    hover_information::HoverInformation,
-);
-
-fn memo_hover_source(
-    view: &ClipboardView,
-    id: i64,
-    owner_bounds: Bounds<Pixels>,
-) -> Option<HoverSource> {
-    let layout = view.todo_layout.borrow();
-    let index = *layout.indexes.get(&id)?;
-    let top_offset = *layout.offsets.get(index)?;
-    let bottom_offset = *layout.offsets.get(index + 1)?;
-    let viewport = view.drag_viewport.get()?;
-    let density = view
-        .todo_preference
-        .value
-        .density(view.display.value.card_density);
-    let spacing = px(visual::card_spacing(density));
-    let scrolled = view.todo_scroll.offset().y;
-    let top = viewport.top() + top_offset + scrolled + spacing;
-    let bottom = viewport.top() + bottom_offset + scrolled - spacing;
-    let visible_top = top.max(viewport.top());
-    let visible_bottom = bottom.min(viewport.bottom());
-    if visible_bottom <= visible_top {
-        return None;
-    }
-    Some((
-        Bounds::new(
-            point(
-                owner_bounds.left() + px(PAGE_PADDING),
-                owner_bounds.top() + visible_top,
-            ),
-            size(
-                owner_bounds.size.width - px(PAGE_PADDING * 2.),
-                visible_bottom - visible_top,
-            ),
-        ),
-        None,
-        hover_information::HoverInformation::plain_text(view.hover_preference.value.details),
-    ))
 }
 
 /// Both history and the isolated onboarding exercise use the same passive

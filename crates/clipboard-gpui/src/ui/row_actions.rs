@@ -47,6 +47,9 @@ impl ClipboardView {
         } else {
             kind.to_owned()
         };
+        if card_note::note_title(item).is_some() {
+            summary.push_str(tr(self.language, " · 备注", " · Note"));
+        }
         if self.display.value.show_time
             && !is_image
             && !matches!(item.content_type.as_str(), "text" | "url")
@@ -111,6 +114,17 @@ impl ClipboardView {
             }))
     }
 
+    pub(super) fn toggle_history_pin(
+        &mut self,
+        id: i64,
+        favorite_only: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.history.loading && self.history.favorite_only() == favorite_only {
+            self.send(Command::TogglePin { id, favorite_only }, cx);
+        }
+    }
+
     /// 卡片右上角的管理操作栏（选择/收藏/置顶/移动/删除）。
     pub(super) fn render_row_action_bar(
         &self,
@@ -121,11 +135,16 @@ impl ClipboardView {
     ) -> Div {
         let marked = self.selected_ids.contains(&id);
         let favorite = item.is_favorite;
-        let pinned = item.is_pinned;
+        let favorite_only = self.history.favorite_only();
+        let pinned = item.pinned_in(favorite_only);
         div()
             .absolute()
             .top(px(card_padding))
-            .right(px(card_padding))
+            .right(if pinned {
+                drag_visual::pin_marker_clearance(self.display.value.pin_marker_style, cx)
+            } else {
+                px(card_padding)
+            })
             .h(px(visual::CONTROL_HEIGHT_COMPACT))
             .px(px(visual::SPACE_1 / 2.))
             .flex()
@@ -203,11 +222,11 @@ impl ClipboardView {
                 } else {
                     tr(self.language, "置顶", "Pin")
                 },
-                false,
+                self.history.loading,
                 false,
                 cx,
                 move |this, _, _, cx| {
-                    this.send(Command::TogglePin(id), cx);
+                    this.toggle_history_pin(id, favorite_only, cx);
                 },
             ))
             .child(self.action_button(
@@ -223,7 +242,12 @@ impl ClipboardView {
                         || this.batch_pending
                         || this.batch_mode
                         || this.paste_state.pending()
-                        || !this.history.items.iter().any(|item| item.id == id)
+                        || !this
+                            .history
+                            .items
+                            .iter()
+                            .flatten()
+                            .any(|item| item.id == id)
                     {
                         return;
                     }

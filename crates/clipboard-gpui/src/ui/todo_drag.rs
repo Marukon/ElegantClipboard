@@ -1,4 +1,4 @@
-use super::todo_card::{TodoDragSnapshot, todo_row_surface};
+use super::todo_card::TodoDragSnapshot;
 use super::*;
 
 #[derive(Clone)]
@@ -10,23 +10,19 @@ pub(super) struct TodoDrag {
 }
 
 impl TodoDrag {
-    pub(super) fn render_card(&self, window: &mut Window, cx: &mut App) -> AnyElement {
-        let density = self
-            .snapshot
-            .todo_preference
-            .density(self.snapshot.display.card_density);
-        drag_visual::drag_card(self.size.get(), density, cx)
-            .child(todo_row_surface(&self.snapshot, true, window, cx))
+    pub(super) fn render_card(&self, cx: &App) -> AnyElement {
+        drag_visual::drag_card(self.size.get(), self.snapshot.layout.density, cx)
+            .child(self.snapshot.surface(self.id, None, false, true, cx))
             .into_any_element()
     }
 }
 
 impl Render for TodoDrag {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.native_preview {
             div().into_any_element()
         } else {
-            self.render_card(window, cx)
+            self.render_card(cx)
         }
     }
 }
@@ -72,7 +68,7 @@ impl ClipboardView {
             .todo_drag_source_id()
             .and_then(|id| layout.indexes.get(&id).copied())
             .map(|index| layout.offsets[index + 1] - layout.offsets[index])
-            .unwrap_or_else(|| px(super::todo_motion::todo_row_fallback(self)));
+            .unwrap_or_else(|| self.memo_card_layout().estimated_row_height());
         let step = height * f32::from(self.card_drag_direction);
         drop(layout);
         let y = (current.y - step).clamp(-self.todo_scroll.max_offset().y, px(0.));
@@ -115,7 +111,7 @@ impl ClipboardView {
             let layout = self.todo_layout.borrow();
             self.drag_motion.update(
                 Some((drag.id, target)),
-                layout.ids.iter().copied(),
+                |id| layout.ids.iter().position(|&row| row == id),
                 &layout.offsets,
             );
             drop(layout);

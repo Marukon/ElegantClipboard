@@ -1,22 +1,106 @@
 use super::todo_drag::TodoDrag;
+use super::todo_layout::MemoCardLayout;
 use super::*;
-use clipboard_core::preferences::{DisplayPreference, TodoPreference};
+use gpui_kit::base::ElementExt as _;
+use gpui_kit::component::text::TextView;
 
 #[derive(Clone)]
 pub(super) struct TodoDragSnapshot {
-    pub todo: Todo,
-    pub display: DisplayPreference,
-    pub language: LanguagePreference,
-    pub todo_preference: TodoPreference,
+    pub(super) text: SharedString,
+    pub(super) layout: MemoCardLayout,
+    summary: SharedString,
 }
 
-pub(super) fn todo_drag_snapshot(view: &ClipboardView, todo: &Todo) -> TodoDragSnapshot {
-    TodoDragSnapshot {
-        todo: todo.clone(),
-        display: view.display.value,
-        language: view.language,
-        todo_preference: view.todo_preference.value,
+impl TodoDragSnapshot {
+    pub(super) fn surface(
+        &self,
+        id: i64,
+        expanded_body: Option<Pixels>,
+        selected: bool,
+        dragging: bool,
+        cx: &App,
+    ) -> Div {
+        let layout = self.layout;
+        let expanded = expanded_body.is_some();
+        let font_size = f32::from(layout.font_size);
+        let text = TextView::markdown(("memo-document", id as usize), self.text.clone())
+            .font_family(crate::fonts::resolve_card_family(
+                &crate::design_system::active_fonts(cx),
+            ))
+            .text_size(px(font_size))
+            .line_height(relative(visual::COPY_LINE_HEIGHT))
+            .selectable(expanded)
+            .scrollable(expanded);
+        let text = if expanded {
+            text
+        } else {
+            let cap = layout.body_height(layout.max_row_height(), false);
+            let lines = (f32::from(cap) / (font_size * visual::COPY_LINE_HEIGHT)).ceil() as usize;
+            // Card clicks expand the memo rather than following embedded links.
+            text.max_lines(lines).max_h(cap).link(|_, _| None)
+        };
+        div()
+            .relative()
+            .w_full()
+            .p(px(visual::card_padding(layout.density)))
+            .gap(px(visual::card_spacing(layout.density)))
+            .flex()
+            .flex_col()
+            .rounded(crate::card_radius::card_radius(cx))
+            .overflow_hidden()
+            .border(px(visual::BORDER_WIDTH))
+            .border_color(if selected {
+                cx.theme().list_active_border
+            } else {
+                crate::design_system::container_border(cx)
+            })
+            .bg(if dragging {
+                cx.theme().popover
+            } else if selected {
+                cx.theme().list_active
+            } else {
+                cx.theme().colors.list
+            })
+            .child(
+                div()
+                    .when_some(expanded_body, |body, height| {
+                        body.h(height).capture_any_mouse_up(|event, window, cx| {
+                            if event.button == MouseButton::Left && !window.is_window_active() {
+                                // Finish the selection before activation can change window bounds.
+                                window.defer(cx, |window, _| {
+                                    native_window::activate_for_input(window);
+                                });
+                            }
+                        })
+                    })
+                    .flex_none()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(text),
+            )
+            .child(
+                div()
+                    .h(px(visual::METADATA_ROW_HEIGHT))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .text_size(px(visual::TEXT_SMALL))
+                    .text_color(cx.theme().muted_foreground.opacity(0.85))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(self.summary.clone()),
+                    ),
+            )
     }
+}
+
+struct MemoSource {
+    revision: u64,
+    text: SharedString,
 }
 
 pub(super) fn todo_empty(message: &str, cx: &App) -> Div {
@@ -67,49 +151,69 @@ pub(super) fn card_excerpt(text: &str) -> String {
         .unwrap_or_default()
 }
 
-pub(super) fn todo_row_surface(
-    snapshot: &TodoDragSnapshot,
-    preview: bool,
-    _window: &mut Window,
-    cx: &mut App,
-) -> impl IntoElement {
-    memo_history_card(snapshot, preview, false, cx)
-}
-
-fn memo_history_card(snapshot: &TodoDragSnapshot, preview: bool, selected: bool, cx: &App) -> Div {
-    let kind = match snapshot.todo.kind {
-        MemoKind::Note => tr(snapshot.language, "笔记", "Note"),
-        MemoKind::Todo => tr(snapshot.language, "待办", "To-do"),
-    };
-    let summary = match todo_meta(snapshot) {
-        Some(meta) => format!("{kind} · {meta}"),
-        None => kind.to_owned(),
-    };
-    super::drag_visual::HistoryCardSnapshot {
-        is_image: false,
-        is_files: false,
-        is_pinned: false,
-        card_index: 0,
-        source_app_name: None,
-        source_app_icon: None,
-        display: snapshot.display,
-        language: snapshot.language,
-        summary,
-        preview_text: card_excerpt(&snapshot.todo.text),
-        highlights: Vec::new(),
-        thumbnail_path: None,
-        thumbnail: None,
-        file_warning: false,
-        file_icon: IconName::FileText,
-        selected,
-    }
-    .surface(preview, false, None, cx)
-}
-
 impl ClipboardView {
+    pub(super) fn close_memo_preview(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.memo_preview.take().is_none() {
+            return false;
+        }
+        cx.notify();
+        true
+    }
+
+    fn open_memo_preview(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.todos_open || self.card_drag_active(cx) {
+            return;
+        }
+        self.sync_todo_layout(window, cx);
+        let Some(index) = self.todo_layout.borrow().selected_index(Some(id)) else {
+            return;
+        };
+        self.memo_preview = Some(id);
+        self.selected_todo = Some(id);
+        self.todo_move_offsets.clear();
+        self.todo_scroll
+            .scroll_to_item(index, ScrollStrategy::Nearest);
+        window.focus(&self.list_focus, cx);
+        cx.notify();
+    }
+
+    fn render_memo_preview_actions(&self, id: i64, cx: &mut Context<Self>) -> impl IntoElement {
+        let language = self.language;
+        div()
+            .h(px(visual::CONTROL_HEIGHT_COMPACT))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap_1()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .child(
+                Button::new("memo-preview-collapse")
+                    .ghost()
+                    .small()
+                    .label(tr(language, "收起", "Collapse"))
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.close_memo_preview(cx);
+                        window.focus(&view.list_focus, cx);
+                    })),
+            )
+            .child(
+                Button::new("memo-preview-edit")
+                    .outline()
+                    .small()
+                    .label(tr(language, "编辑", "Edit"))
+                    .disabled(self.todos_pending || self.todo_editor_unavailable())
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        view.open_todo_editor(Some(id), window, cx);
+                    })),
+            )
+    }
+
     pub(super) fn render_todo_item(
         &self,
         index: usize,
+        card_layout: MemoCardLayout,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -119,11 +223,47 @@ impl ClipboardView {
                 .h(px(visual::CONTROL_HEIGHT_LARGE + visual::SPACE_6))
                 .into_any_element();
         };
-        let todo = self.todos[source].clone();
+        let todo = &self.todos[source];
         let id = todo.id;
+        let row_height = layout.sizes[index].height;
         let (from, to) = self.drag_motion.offsets(index, &layout.offsets);
         drop(layout);
-        let row = self.render_todo_row(todo, self.todos_pending, window, cx);
+
+        let revision = self.todo_revision;
+        let source = window.use_keyed_state(("memo-source", id as usize), cx, |_, _| MemoSource {
+            revision,
+            text: todo.text.as_str().into(),
+        });
+        if source.read(cx).revision != revision {
+            source.update(cx, |source, _| {
+                source.revision = revision;
+                if source.text.as_ref() != todo.text.as_str() {
+                    source.text = todo.text.as_str().into();
+                }
+            });
+        }
+        let snapshot = TodoDragSnapshot {
+            text: source.read(cx).text.clone(),
+            layout: card_layout,
+            summary: todo_summary(self, todo),
+        };
+        if self.memo_preview == Some(id) {
+            let body_height = card_layout.body_height(row_height, true);
+            return Self::todo_row_frame(todo, card_layout, row_height, cx)
+                .child(
+                    snapshot
+                        .surface(
+                            id,
+                            Some(body_height),
+                            self.selected_todo == Some(id),
+                            false,
+                            cx,
+                        )
+                        .child(self.render_memo_preview_actions(id, cx)),
+                )
+                .into_any_element();
+        }
+        let row = self.render_todo_row(todo, snapshot, row_height, cx);
         if from != 0. || to != 0. {
             visual::drag_yield(
                 div().child(row),
@@ -145,91 +285,56 @@ impl ClipboardView {
         }
     }
 
-    pub(super) fn render_todo_row(
+    fn render_todo_row(
         &self,
-        todo: Todo,
-        pending: bool,
-        _window: &mut Window,
+        todo: &Todo,
+        snapshot: TodoDragSnapshot,
+        row_height: Pixels,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = todo.id;
-        let status = todo.status;
-        let text = todo.text.clone();
-        let remove_owner = cx.entity().downgrade();
-        let layout = self.todo_layout.clone();
-        let list_surface = self.list_surface.downgrade();
+        let text = snapshot.text.clone();
+        let layout = snapshot.layout;
+        let pending = self.todos_pending;
         let entity = cx.entity();
-        let menu_owner = entity.clone();
-        let snapshot = todo_drag_snapshot(self, &todo);
-        let density = self
-            .todo_preference
-            .value
-            .density(self.display.value.card_density);
-        let card_spacing = visual::card_spacing(density);
-        let card_padding = visual::card_padding(density);
+        let card_padding = visual::card_padding(layout.density);
         let measured_size = Rc::new(Cell::new(size(px(0.), px(0.))));
+        let surface = snapshot
+            .surface(id, None, self.selected_todo == Some(id), false, cx)
+            .group("todo-card")
+            .child(todo_action_bar(self, id, pending, card_padding, cx));
         let drag = TodoDrag {
             id,
-            snapshot: snapshot.clone(),
+            snapshot,
             size: measured_size.clone(),
             native_preview: false,
         };
         let drag_enabled = !pending && !self.todo_reorder_pending && self.todos_open;
-        // 操作栏是分组子节点，离开卡片后 group_hover 才会收起。选中不显示按钮。
-        let surface = div()
-            .group("todo-card")
-            .w_full()
-            .child(memo_history_card(
-                &snapshot,
-                false,
-                self.selected_todo == Some(id),
-                cx,
-            ))
-            .child(todo_action_bar(
-                self,
-                id,
-                &todo.text,
-                pending,
-                remove_owner,
-                card_padding,
-                cx,
-            ));
-        div()
-            .id(("todo-row", id as usize))
-            .relative()
-            .w_full()
-            .px(px(PAGE_PADDING))
-            .pt(px(card_spacing))
-            .pb(px(card_spacing))
+        let measured_layout = self.todo_layout.clone();
+        let list = self.list_surface.downgrade();
+        Self::todo_row_frame(todo, layout, row_height, cx)
             .child(
-                canvas(
-                    move |bounds, window, _| {
-                        let height = f32::from(bounds.size.height);
-                        let mut layout = layout.borrow_mut();
-                        if layout.record_height(id, height) {
-                            let list_surface = list_surface.clone();
+                div()
+                    .relative()
+                    .flex_none()
+                    .w_full()
+                    .child(surface)
+                    .on_prepaint(move |bounds, window, _| {
+                        let height = (bounds.size.height
+                            + px(2. * visual::card_spacing(layout.density)))
+                        .min(layout.max_row_height());
+                        measured_size.set(size(bounds.size.width + px(2. * PAGE_PADDING), height));
+                        if measured_layout.borrow_mut().record_row_height(id, height) {
                             window.on_next_frame(move |_, cx| {
-                                let _ = list_surface.update(cx, |_, cx| cx.notify());
+                                let _ = list.update(cx, |_, cx| cx.notify());
                             });
                         }
-                        measured_size.set(bounds.size);
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full(),
+                    }),
             )
-            .child(surface)
-            .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                 if *hovered && !this.card_drag_active(cx) {
                     this.select_todo(id, cx);
                 }
-                this.set_memo_hover(id, *hovered, window, cx);
-            }))
-            .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
-                this.update_hover_anchor(id, event.position.y, cx);
             }))
             .on_mouse_down(
                 MouseButton::Left,
@@ -237,27 +342,15 @@ impl ClipboardView {
                     this.prepare_memo_drag(id, &text, cx);
                 }),
             )
-            .on_mouse_down(
-                MouseButton::Right,
-                move |event: &MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    ClipboardView::open_todo_menu(
-                        menu_owner.clone(),
-                        id,
-                        todo.text.clone(),
-                        status,
-                        event.position,
-                        window,
-                        cx,
-                    );
-                },
-            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.open_memo_preview(id, window, cx);
+            }))
             .when(drag_enabled, |row| {
                 row.cursor_grab()
                     .on_drag(drag, move |drag, offset, window, cx| {
                         let mut preview = drag.clone();
                         entity.update(cx, |this, cx| {
-                            this.close_hover_preview("todo_drag_started", cx);
+                            this.close_memo_preview(cx);
                             this.todo_drop_target = None;
                             this.todo_move_offsets.clear();
                             this.drag_motion.hovered = None;
@@ -278,19 +371,45 @@ impl ClipboardView {
             })
             .into_any_element()
     }
+
+    fn todo_row_frame(
+        todo: &Todo,
+        layout: MemoCardLayout,
+        height: Pixels,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let (id, status) = (todo.id, todo.status);
+        let owner = cx.weak_entity();
+        div()
+            .id(("todo-row", id as usize))
+            .relative()
+            .w_full()
+            .h(height)
+            .flex()
+            .flex_col()
+            // Keep a new estimate from letting a tall card paint over its neighbor.
+            .overflow_hidden()
+            .px(px(PAGE_PADDING))
+            .py(px(visual::card_spacing(layout.density)))
+            .on_mouse_down(
+                MouseButton::Right,
+                move |event: &MouseDownEvent, window, cx| {
+                    if let Some(owner) = owner.upgrade() {
+                        cx.stop_propagation();
+                        Self::open_todo_menu(owner, id, status, event.position, window, cx);
+                    }
+                },
+            )
+    }
 }
 
 fn todo_action_bar(
     view: &ClipboardView,
     id: i64,
-    text: &str,
     pending: bool,
-    owner: gpui_kit::WeakEntity<ClipboardView>,
     card_padding: f32,
     cx: &mut Context<ClipboardView>,
 ) -> impl IntoElement {
-    let edit_owner = owner.clone();
-    let source = text.to_owned();
     div()
         .id(("todo-actions", id as usize))
         .absolute()
@@ -317,13 +436,12 @@ fn todo_action_bar(
                 ("todo-edit", id as usize),
                 IconName::FileText,
                 tr(view.language, "编辑", "Edit"),
-                pending,
+                pending || view.todo_editor_unavailable(),
             )
-            .on_click(move |_, window, cx| {
-                let _ = edit_owner.update(cx, |view, cx| {
-                    view.open_todo_editor(Some(id), source.clone(), window, cx);
-                });
-            }),
+            .on_click(cx.listener(move |view, _, window, cx| {
+                cx.stop_propagation();
+                view.open_todo_editor(Some(id), window, cx);
+            })),
         )
         .child(
             todo_icon_button(
@@ -332,9 +450,10 @@ fn todo_action_bar(
                 tr(view.language, "移除", "Remove"),
                 pending,
             )
-            .on_click(move |_, _, cx| {
-                let _ = owner.update(cx, |view, cx| view.remove_todo(id, cx));
-            }),
+            .on_click(cx.listener(move |view, _, _, cx| {
+                cx.stop_propagation();
+                view.remove_todo(id, cx);
+            })),
         )
 }
 
@@ -355,47 +474,43 @@ fn todo_icon_button(
         .disabled(disabled)
 }
 
-/// 元信息：非「待处理」时显示进度文案；时间仍按设置。
-fn todo_meta(snapshot: &TodoDragSnapshot) -> Option<String> {
-    let preference = snapshot.todo_preference;
-    let status = match snapshot.todo.status {
-        TodoStatus::Pending => None,
-        status => Some(super::todo_notice::todo_status_label(
-            snapshot.language,
-            status,
-        )),
-    };
-    let now = chrono::Local::now().naive_local();
-    let created = preference.show_created.then(|| {
-        format_card_time(
-            &snapshot.todo.created_at,
-            snapshot.display.time_format,
-            snapshot.language,
-            now,
-        )
-    });
-    let edited = preference.show_edited.then(|| {
-        format_card_time(
-            &snapshot.todo.updated_at,
-            snapshot.display.time_format,
-            snapshot.language,
-            now,
-        )
-    });
-    let chinese = snapshot.language == LanguagePreference::Chinese;
-    let times = match (created, edited) {
-        (Some(created), Some(edited)) if chinese => Some(format!("创建 {created} · 编辑 {edited}")),
-        (Some(created), Some(edited)) => Some(format!("Created {created} · Edited {edited}")),
-        (Some(created), None) if chinese => Some(format!("创建 {created}")),
-        (Some(created), None) => Some(format!("Created {created}")),
-        (None, Some(edited)) if chinese => Some(format!("编辑 {edited}")),
-        (None, Some(edited)) => Some(format!("Edited {edited}")),
-        (None, None) => None,
-    };
-    match (status, times) {
-        (Some(status), Some(times)) => Some(format!("{status} · {times}")),
-        (Some(status), None) => Some(status.to_owned()),
-        (None, Some(times)) => Some(times),
-        (None, None) => None,
+fn todo_summary(view: &ClipboardView, todo: &Todo) -> SharedString {
+    let language = view.language;
+    let mut summary = match todo.kind {
+        MemoKind::Note => tr(language, "笔记", "Note"),
+        MemoKind::Todo => tr(language, "待办", "To-do"),
     }
+    .to_owned();
+    if todo.status != TodoStatus::Pending {
+        summary.push_str(" · ");
+        summary.push_str(super::todo_notice::todo_status_label(language, todo.status));
+    }
+    let preference = view.todo_preference.value;
+    if preference.show_created || preference.show_edited {
+        let now = chrono::Local::now().naive_local();
+        for (show, timestamp, label) in [
+            (
+                preference.show_created,
+                &todo.created_at,
+                tr(language, "创建 ", "Created "),
+            ),
+            (
+                preference.show_edited,
+                &todo.updated_at,
+                tr(language, "编辑 ", "Edited "),
+            ),
+        ] {
+            if show {
+                summary.push_str(" · ");
+                summary.push_str(label);
+                summary.push_str(&format_card_time(
+                    timestamp,
+                    view.display.value.time_format,
+                    language,
+                    now,
+                ));
+            }
+        }
+    }
+    summary.into()
 }

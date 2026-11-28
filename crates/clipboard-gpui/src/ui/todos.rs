@@ -9,13 +9,6 @@ use super::todo_notice::{
     NoticeStatus, notice_status, notice_text, show_todo_notice, todo_status_label,
 };
 
-#[derive(Clone, Debug)]
-pub(super) struct TodoDraft {
-    pub id: Option<i64>,
-    pub text: String,
-    pub kind: MemoKind,
-}
-
 impl ClipboardView {
     pub(super) fn select_toolbar_tab(
         &mut self,
@@ -43,7 +36,9 @@ impl ClipboardView {
         self.close_hover_preview("todos", cx);
         self.close_history_confirmation(window, cx);
         self.group_move_id = None;
-        self.located = None;
+        if self.located.take().is_some() && !self.search.read(cx).value().is_empty() {
+            self.history.invalidate_all_view();
+        }
         self.locate_id = None;
         self.located_matches.clear();
         self.reset_selection();
@@ -111,27 +106,14 @@ impl ClipboardView {
         cx.notify();
     }
 
-    pub(super) fn edit_selected_todo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.todos_open || self.todos_pending {
-            return;
+    fn edit_selected_todo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.selected_todo {
+            self.open_todo_editor(Some(id), window, cx);
         }
-        self.sync_todo_layout(window, cx);
-        let layout = self.todo_layout.borrow();
-        let Some(index) = layout.selected_index(self.selected_todo) else {
-            return;
-        };
-        let todo = &self.todos[layout.sources[index]];
-        let (id, text) = (todo.id, todo.text.clone());
-        drop(layout);
-        self.open_todo_editor(Some(id), text, window, cx);
     }
 
     pub(super) fn remove_todo(&mut self, id: i64, cx: &mut Context<Self>) {
-        if self
-            .todo_draft
-            .as_ref()
-            .is_some_and(|draft| draft.id == Some(id))
-        {
+        if self.todo_draft == Some(todo_editor::TodoDraft::Edit(id)) {
             let message = self.editor_draft_blocker(cx).unwrap_or_else(|| {
                 tr(
                     self.language,
@@ -168,18 +150,18 @@ impl ClipboardView {
     pub(super) fn open_todo_menu(
         entity: Entity<Self>,
         id: i64,
-        text: String,
         status: TodoStatus,
         position: Point<Pixels>,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let (pending, language) = entity.update(cx, |view, cx| {
+        let (pending, language, main) = entity.update(cx, |view, cx| {
             view.selected_todo = Some(id);
             cx.notify();
             (
                 view.todos_pending || view.todo_editor_unavailable(),
                 view.language,
+                view.main_window,
             )
         });
         menu_window::HistoryMenuWindow::open(
@@ -213,10 +195,14 @@ impl ClipboardView {
                             .disabled(pending)
                             .on_click({
                                 let entity = entity.clone();
-                                let text = text.clone();
-                                move |_, window, cx| {
-                                    entity.update(cx, |view, cx| {
-                                        view.open_todo_editor(Some(id), text.clone(), window, cx);
+                                move |_, _, cx| {
+                                    let entity = entity.clone();
+                                    cx.defer(move |cx| {
+                                        let _ = main.update(cx, |_, window, cx| {
+                                            entity.update(cx, |view, cx| {
+                                                view.open_todo_editor(Some(id), window, cx);
+                                            });
+                                        });
                                     });
                                 }
                             }),
@@ -252,69 +238,6 @@ impl ClipboardView {
         }
     }
 
-    /// 待办编辑器与历史条目编辑器（含主窗口备注对话框）共用 editor 会话，
-    /// 浮钮的禁用状态必须与此保持一致，否则表现为点击无反应。
-    pub(super) fn todo_editor_unavailable(&self) -> bool {
-        self.editor_pending()
-            || self.todo_edit_saving
-            || self.editor.id.is_some()
-            || self.editor_window.is_some()
-            || self.todo_draft.is_some()
-            || matches!(self.update_check, UpdateCheck::Installing)
-    }
-
-    pub(super) fn open_todo_editor(
-        &mut self,
-        id: Option<i64>,
-        text: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.todo_editor_unavailable() {
-            if let Some(message) = self.editor_draft_blocker(cx) {
-                self.reveal_editor(message, cx);
-            }
-            return;
-        }
-        let kind = id
-            .and_then(|id| self.todos.iter().find(|todo| todo.id == id))
-            .map(|todo| todo.kind)
-            .unwrap_or(MemoKind::Todo);
-        self.todo_draft = Some(TodoDraft { id, text, kind });
-        self.editor_error = None;
-        self.open_editor_window(window, cx, |view| {
-            view.todo_draft.is_some() && view.editor_window.is_none()
-        });
-    }
-
-    pub(super) fn save_todo_editor(&mut self, text: String, cx: &mut Context<Self>) {
-        if self.todos_pending || self.editor_discard_open {
-            return;
-        }
-        let Some(draft) = &self.todo_draft else {
-            return;
-        };
-        let adding = draft.id.is_none();
-        let command = match draft.id {
-            Some(id) => Command::UpdateTodo { id, text },
-            None => Command::AddTodo {
-                text,
-                kind: draft.kind,
-            },
-        };
-        if self.send(command, cx) {
-            if adding {
-                self.todo_notice = Some(TodoNotice::Added);
-            }
-            self.todos_pending = true;
-            self.todo_edit_saving = true;
-            self.editor_error = None;
-            cx.notify();
-        } else {
-            self.editor_error = Some(self.message.clone());
-        }
-    }
-
     pub(super) fn apply_todos(
         &mut self,
         todos: Vec<Todo>,
@@ -338,25 +261,28 @@ impl ClipboardView {
                 }
             }
         }
-        self.start_todo_slide(&todos, cx);
+        if self.memo_preview.is_none() {
+            self.start_todo_slide(&todos, cx);
+        }
         if self.todo_reorder_pending {
             self.drag_motion = DragMotionState::default();
         }
         if self.todos != todos {
+            self.close_memo_preview(cx);
+            self.todo_revision = self.todo_revision.wrapping_add(1);
             self.todo_layout
                 .borrow_mut()
-                .retain_measurements(&self.todos, &todos);
+                .retain_row_heights(&self.todos, &todos);
+            self.todos = todos;
         }
-        self.todos = todos;
         self.todos_pending = false;
         self.todo_reorder_pending = false;
         self.todo_drop_target = None;
+        if std::mem::take(&mut self.todo_edit_saving) {
+            self.close_editor(window, cx);
+        }
         if self.todos_open {
             self.sync_todo_layout(window, cx);
-        }
-        if self.todo_edit_saving {
-            self.todo_edit_saving = false;
-            self.close_editor(window, cx);
         }
         true
     }
@@ -444,8 +370,9 @@ impl ClipboardView {
                             "todo-virtual-list",
                             self.todo_layout.borrow().sizes.clone(),
                             |this, visible, window, cx| {
+                                let card = this.memo_card_layout();
                                 visible
-                                    .map(|index| this.render_todo_item(index, window, cx))
+                                    .map(|index| this.render_todo_item(index, card, window, cx))
                                     .collect()
                             },
                         )

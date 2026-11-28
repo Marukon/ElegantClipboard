@@ -5,10 +5,10 @@ pub(in crate::ui) struct DragPreview {
 }
 
 impl Render for DragPreview {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         match self.card.as_ref() {
             Some(CardDrag::History(drag)) => drag.render_card(cx),
-            Some(CardDrag::Todo(drag)) => drag.render_card(window, cx),
+            Some(CardDrag::Todo(drag)) => drag.render_card(cx),
             None => div().into_any_element(),
         }
     }

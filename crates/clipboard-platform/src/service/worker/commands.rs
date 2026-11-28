@@ -17,14 +17,27 @@ impl Worker {
                 category,
                 group_id,
                 limit,
+                offset,
                 generation,
             } => {
+                let reason = if generation != self.generation
+                    || favorite_only != self.favorite_only
+                    || search != self.search
+                    || group_id != self.group_id
+                    || category != self.category
+                {
+                    super::SnapshotReason::Scope
+                } else {
+                    super::SnapshotReason::Page
+                };
                 self.search = search;
                 self.favorite_only = favorite_only;
                 self.category = category;
                 self.group_id = group_id;
                 self.limit = limit;
+                self.offset = offset;
                 self.generation = generation;
+                return self.send_snapshot(reason);
             }
             Command::Capture(text) => {
                 self.history.capture_with_media(&text, &self.images_dir)?;
@@ -177,8 +190,8 @@ impl Worker {
                 };
                 self.send_event(Event::Status(message.into()))?;
             }
-            Command::TogglePin(id) => {
-                self.history.toggle_pin(id)?;
+            Command::TogglePin { id, favorite_only } => {
+                self.history.toggle_pin(id, favorite_only)?;
             }
             Command::BumpToTop(id) => {
                 self.history.bump_to_top(id)?;

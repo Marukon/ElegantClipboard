@@ -4,7 +4,7 @@ mod tests;
 use gpui_kit::{ImageCacheError, ImageSource, RenderImage};
 use image::{DynamicImage, Frame, ImageDecoder, ImageFormat, ImageReader};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant, SystemTime},
@@ -13,6 +13,12 @@ use std::{
 const MAX_CONCURRENT: usize = 2;
 const MAX_DECODE_BYTES: u64 = 128 * 1024 * 1024;
 const FILE_RECHECK: Duration = Duration::from_secs(5);
+/// Decoded bitmaps stay resident while visible, then cool down instead of being
+/// dropped: switching groups or scrolling back reuses them at zero cost.
+const BYTE_BUDGET: usize = 24 * 1024 * 1024;
+const HIDDEN_BYTE_BUDGET: usize = 4 * 1024 * 1024;
+/// Caps entries whose result occupies no decoded pixels (`Original`/`Failed`).
+const MAX_ENTRIES: usize = 512;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct ThumbnailKey {
@@ -70,6 +76,9 @@ struct Entry {
     result: Option<Thumbnail>,
     version: Option<FileVersion>,
     checked: Instant,
+    /// Decoded pixel bytes, counted only for `Ready` results.
+    bytes: usize,
+    last_used: u64,
 }
 
 pub(super) struct ThumbnailJob {
@@ -83,7 +92,6 @@ pub(super) struct ThumbnailResult {
     image: Option<Thumbnail>,
 }
 
-#[derive(Default)]
 pub(super) struct ThumbnailCache {
     // Keep the first visible position without duplicating keys in an ordered collection.
     wanted: HashMap<ThumbnailKey, usize>,
@@ -92,26 +100,97 @@ pub(super) struct ThumbnailCache {
     next_token: u64,
     // A drag snapshot can outlive its row. Delay atlas removal until it releases its Arc.
     retired: Vec<Arc<RenderImage>>,
+    bytes: usize,
+    clock: u64,
+    byte_budget: usize,
+    hidden_byte_budget: usize,
+}
+
+impl Default for ThumbnailCache {
+    fn default() -> Self {
+        Self {
+            wanted: HashMap::new(),
+            entries: HashMap::new(),
+            running: HashMap::new(),
+            next_token: 0,
+            retired: Vec::new(),
+            bytes: 0,
+            clock: 0,
+            byte_budget: BYTE_BUDGET,
+            hidden_byte_budget: HIDDEN_BYTE_BUDGET,
+        }
+    }
+}
+
+fn byte_len(image: &RenderImage) -> usize {
+    let size = image.size(0);
+    usize::try_from(size.width.0).unwrap_or(0)
+        * usize::try_from(size.height.0).unwrap_or(0)
+        * 4
+        * image.frame_count()
 }
 
 impl ThumbnailCache {
+    /// Refresh the visible priority set and touch every matching entry. Entries
+    /// leaving the visible scope stay resident until budget pressure evicts the
+    /// coldest ones, so switching groups and coming back costs nothing.
     pub fn retain<I>(&mut self, wanted: I)
     where
         I: IntoIterator<Item = ThumbnailKey>,
     {
         self.wanted.clear();
         for (position, key) in wanted.into_iter().enumerate() {
-            self.wanted.entry(key).or_insert(position);
-        }
-        self.entries.retain(|key, entry| {
-            if self.wanted.contains_key(key) {
-                return true;
+            self.wanted.entry(key.clone()).or_insert(position);
+            // Advance per key so rows touched within one frame keep their order:
+            // higher rows stay warmer than lower ones.
+            self.clock += 1;
+            if let Some(entry) = self.entries.get_mut(&key) {
+                entry.last_used = self.clock;
             }
-            if let Some(Thumbnail::Ready(image)) = entry.result.take() {
+        }
+        self.evict(self.byte_budget);
+    }
+
+    /// The hidden window keeps only the most recent screenful warm.
+    pub fn release_for_hidden(&mut self) {
+        self.wanted.clear();
+        self.evict(self.hidden_byte_budget);
+    }
+
+    /// Evict the coldest entries beyond `budget` bytes or `MAX_ENTRIES` in total.
+    /// Wanted and in-flight entries are immune: evicting either would re-decode
+    /// work the list is actively waiting for.
+    fn evict(&mut self, budget: usize) {
+        while self.bytes > budget || self.entries.len() > MAX_ENTRIES {
+            let candidate = self
+                .entries
+                .iter()
+                .filter(|(key, entry)| {
+                    !self.wanted.contains_key(*key) && !self.running.contains_key(&entry.token)
+                })
+                // Tokens increase monotonically per job, so they order entries
+                // created within a single frame whose `last_used` ties.
+                .min_by_key(|(_, entry)| (entry.last_used, entry.token))
+                .map(|(key, _)| key.clone());
+            let Some(key) = candidate else { break };
+            let Some(entry) = self.entries.remove(&key) else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(entry.bytes);
+            if let Some(Thumbnail::Ready(image)) = entry.result {
                 self.retired.push(image);
             }
-            false
-        });
+        }
+    }
+
+    /// Paths whose rows render the original file directly (animated formats),
+    /// so the decoded asset must stay in GPUI's cache while the entry lives.
+    pub fn original_paths(&self) -> HashSet<PathBuf> {
+        self.entries
+            .iter()
+            .filter(|(_, entry)| matches!(entry.result, Some(Thumbnail::Original)))
+            .map(|(key, _)| key.path.clone())
+            .collect()
     }
 
     pub fn source(&self, key: &ThumbnailKey) -> Option<ImageSource> {
@@ -150,6 +229,8 @@ impl ThumbnailCache {
             result: None,
             version: None,
             checked: Instant::now(),
+            bytes: 0,
+            last_used: self.clock,
         });
         entry.token = token;
         self.running.insert(token, key.clone());
@@ -160,7 +241,7 @@ impl ThumbnailCache {
         })
     }
 
-    pub fn finish(&mut self, token: u64, result: ThumbnailResult) -> Option<PathBuf> {
+    pub fn finish(&mut self, token: u64, result: ThumbnailResult) -> Option<(PathBuf, bool)> {
         let key = self.running.remove(&token)?;
         // Eviction and re-entry can queue another request for the very same key.
         let entry = self
@@ -169,13 +250,23 @@ impl ThumbnailCache {
             .filter(|entry| entry.token == token)?;
         entry.checked = Instant::now();
         entry.version = result.version;
-        if let Some(image) = result.image {
-            if let Some(Thumbnail::Ready(old)) = entry.result.replace(image) {
-                self.retired.push(old);
-            }
-            return Some(key.path);
+        let image = result.image?;
+        let bytes = match &image {
+            Thumbnail::Ready(render) => byte_len(render),
+            _ => 0,
+        };
+        // Replacing an existing result means the file changed: the caller must
+        // invalidate the original-path asset so rows re-read it. A first fill
+        // must not, or it would discard previews already rendering that path.
+        let invalidate = entry.result.is_some();
+        if let Some(Thumbnail::Ready(old)) = entry.result.replace(image) {
+            self.retired.push(old);
         }
-        None
+        self.bytes = self.bytes.saturating_add(bytes) - entry.bytes;
+        entry.bytes = bytes;
+        // Entries inserted since the last `retain` are accounted for here.
+        self.evict(self.byte_budget);
+        Some((key.path, invalidate))
     }
 
     pub fn released_images(&mut self) -> Vec<Arc<RenderImage>> {
@@ -191,8 +282,15 @@ impl ThumbnailCache {
         released
     }
 
+    /// View teardown drops everything regardless of budget.
     pub fn drain_images(&mut self) -> Vec<Arc<RenderImage>> {
-        self.retain(Vec::new());
+        self.wanted.clear();
+        self.bytes = 0;
+        for entry in std::mem::take(&mut self.entries).into_values() {
+            if let Some(Thumbnail::Ready(image)) = entry.result {
+                self.retired.push(image);
+            }
+        }
         std::mem::take(&mut self.retired)
     }
 }

@@ -304,6 +304,14 @@ pub enum SourceAppDisplay {
     Icon,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PinMarkerStyle {
+    #[default]
+    Swallowtail,
+    FoldedCorner,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CategoryTabVisibility {
@@ -341,6 +349,7 @@ pub struct DisplayPreference {
     pub category_tabs: CategoryTabVisibility,
     pub card_density: CardDensity,
     pub card_max_lines: u8,
+    pub pin_marker_style: PinMarkerStyle,
     pub show_time: bool,
     pub time_format: TimeFormat,
     pub show_char_count: bool,
@@ -356,6 +365,7 @@ impl Default for DisplayPreference {
             category_tabs: CategoryTabVisibility::default(),
             card_density: CardDensity::Standard,
             card_max_lines: 2,
+            pin_marker_style: PinMarkerStyle::default(),
             show_time: true,
             time_format: TimeFormat::Absolute,
             show_char_count: true,

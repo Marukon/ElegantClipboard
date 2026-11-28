@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 11 20">
+  <defs>
+    <linearGradient id="ribbon">
+      <stop stop-color="currentColor" stop-opacity="0.69" />
+      <stop offset="0.2" stop-color="currentColor" />
+      <stop offset="0.77" stop-color="currentColor" stop-opacity="0.92" />
+      <stop offset="1" stop-color="currentColor" stop-opacity="0.71" />
+    </linearGradient>
+  </defs>
+  <path fill="url(#ribbon)" d="M0 0H11V20L5.5 15.5L0 20Z" />
+</svg>

@@ -57,6 +57,7 @@ fn backup_roundtrips_all_non_default_preferences() -> Result<()> {
             category_tabs: CategoryTabVisibility::default(),
             card_density: CardDensity::Spacious,
             card_max_lines: 5,
+            pin_marker_style: PinMarkerStyle::FoldedCorner,
             show_time: false,
             time_format: TimeFormat::Relative,
             show_char_count: false,

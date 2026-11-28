@@ -55,6 +55,21 @@ fn notes_persist_search_and_reject_oversize() -> Result<()> {
 }
 
 #[test]
+fn noted_file_search_shows_the_matching_path_without_replacing_the_saved_summary() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let history = History::open(dir.path().join("clipboard.db"))?;
+    let paths = ["team/Release/report.txt".to_owned()];
+    let id = history.capture_files(&paths, &dir.path().join("images"))?;
+    history.set_note(id, "部署清单")?;
+
+    let rows = history.list("release", 10, false)?;
+    assert_eq!(rows[0].note.as_deref(), Some("部署清单"));
+    assert_eq!(rows[0].preview.as_deref(), Some(paths[0].as_str()));
+    assert_eq!(history.item(id)?.preview.as_deref(), Some("report.txt"));
+    Ok(())
+}
+
+#[test]
 fn database_maintenance_reclaims_free_pages_and_preserves_history() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let database = directory.path().join("clipboard.db");
@@ -121,7 +136,7 @@ fn moving_items_between_groups_preserves_history_and_rejects_stale_source() -> R
     let history = History::open(dir.path().join("clipboard.db"))?;
     let id = history.capture("important text")?.unwrap();
     history.toggle_favorite(id)?;
-    history.toggle_pin(id)?;
+    history.toggle_pin(id, false)?;
     let work = history.create_group("工作")?;
     let archive = history.create_group("归档")?;
     assert!(history.move_to_group(id, None, Some(-1)).is_err());
@@ -325,7 +340,7 @@ fn literal_search_pin_delete_and_limits() -> Result<()> {
     let id = history.capture("100%_done")?.unwrap();
     history.capture("plain text")?;
     assert_eq!(history.count("%_", false)?, 1);
-    history.toggle_pin(id)?;
+    history.toggle_pin(id, false)?;
     assert_eq!(history.list("", PAGE_SIZE, false)?[0].id, id);
     assert_eq!(history.capture(" \r\n")?, None);
     assert!(history.capture(&"x".repeat(MAX_TEXT_BYTES + 1)).is_err());
