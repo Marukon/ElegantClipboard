@@ -14,10 +14,10 @@ impl ClipboardView {
                 .editor_input
                 .as_ref()
                 .is_some_and(|(input, original)| input.read(cx).text() != original)
-            || self
-                .todo_draft
-                .as_ref()
-                .is_some_and(|draft| draft.id.is_none() && draft.kind != MemoKind::Todo)
+            || matches!(
+                self.todo_draft,
+                Some(todo_editor::TodoDraft::New(MemoKind::Note))
+            )
     }
 
     pub(super) fn editor_draft_blocker(&self, cx: &App) -> Option<&'static str> {
@@ -377,7 +377,7 @@ impl ClipboardView {
             if !self.send(Command::EditContent { id, generation }, cx) {
                 self.editor.apply(id, generation, Err(self.message.clone()));
             }
-            self.open_content_editor(id, window, cx);
+            self.open_editor_window(window, cx, None);
         } else {
             self.note_original = Some(self.note_input.update(cx, |input, cx| {
                 input.set_value(note, window, cx);

@@ -80,6 +80,7 @@ mod theme_color;
 mod thumbnail_cache;
 mod todo_card;
 mod todo_drag;
+mod todo_editor;
 mod todo_layout;
 mod todo_motion;
 mod todo_notice;
@@ -316,7 +317,9 @@ struct ClipboardView {
     selected_todo: Option<i64>,
     todos: Vec<Todo>,
     todos_pending: bool,
-    todo_draft: Option<todos::TodoDraft>,
+    todo_revision: u64,
+    memo_preview: Option<i64>,
+    todo_draft: Option<todo_editor::TodoDraft>,
     todo_edit_saving: bool,
     todo_notice: Option<todos::TodoNotice>,
     todo_layout: Rc<RefCell<todo_layout::TodoListLayout>>,

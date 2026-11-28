@@ -330,6 +330,8 @@ impl ClipboardView {
             selected_todo: None,
             todos: Vec::new(),
             todos_pending: false,
+            todo_revision: 0,
+            memo_preview: None,
             todo_draft: None,
             todo_edit_saving: false,
             todo_notice: None,

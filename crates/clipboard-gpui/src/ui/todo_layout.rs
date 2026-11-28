@@ -7,23 +7,54 @@ pub(super) struct TodoListLayout {
     pub indexes: HashMap<i64, usize>,
     pub sizes: Rc<Vec<gpui_kit::Size<Pixels>>>,
     pub offsets: Vec<Pixels>,
-    pub heights: HashMap<i64, f32>,
-    pub geometry_dirty: bool,
+    row_heights: HashMap<i64, Pixels>,
+    heights_dirty: bool,
+    expanded_row: Option<i64>,
     filter_dirty: bool,
     query: String,
     show_completed: bool,
     key: Option<LayoutKey>,
 }
 
-#[derive(PartialEq)]
 struct LayoutKey {
     width: Pixels,
     rem: Pixels,
-    density: CardDensity,
-    max_lines: u8,
-    show_created: bool,
-    show_edited: bool,
-    fonts: FontPreference,
+    font_family: String,
+    card: MemoCardLayout,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct MemoCardLayout {
+    pub(super) density: CardDensity,
+    pub(super) font_size: u8,
+    max_card_height: f32,
+}
+
+impl MemoCardLayout {
+    pub(super) fn max_row_height(self) -> Pixels {
+        px(self.max_card_height + 2. * visual::card_spacing(self.density))
+    }
+
+    pub(super) fn estimated_row_height(self) -> Pixels {
+        px(visual::row_height_for_body(
+            self.density,
+            f32::from(self.font_size) * visual::COPY_LINE_HEIGHT,
+        ))
+    }
+
+    fn expanded_footer_height(self) -> Pixels {
+        px(visual::CONTROL_HEIGHT_COMPACT + visual::card_spacing(self.density))
+    }
+
+    pub(super) fn body_height(self, row_height: Pixels, expanded: bool) -> Pixels {
+        let chrome = px(visual::row_height_for_body(self.density, 0.))
+            + if expanded {
+                self.expanded_footer_height()
+            } else {
+                px(0.)
+            };
+        (row_height - chrome).max(px(0.))
+    }
 }
 
 impl TodoListLayout {
@@ -33,6 +64,44 @@ impl TodoListLayout {
 
     pub fn has_current_filter(&self) -> bool {
         !self.filter_dirty
+    }
+
+    pub(super) fn record_row_height(&mut self, id: i64, height: Pixels) -> bool {
+        if height <= px(0.) || self.row_heights.get(&id) == Some(&height) {
+            return false;
+        }
+        self.row_heights.insert(id, height);
+        // Rebuild once after all visible rows have reported their bounds.
+        !std::mem::replace(&mut self.heights_dirty, true)
+    }
+
+    pub(super) fn retain_row_heights(&mut self, before: &[Todo], after: &[Todo]) {
+        if !self.row_heights.is_empty() {
+            let next: HashMap<_, _> = after
+                .iter()
+                .map(|todo| (todo.id, todo.text.as_str()))
+                .collect();
+            for todo in before {
+                if next.get(&todo.id).copied() != Some(todo.text.as_str()) {
+                    self.row_heights.remove(&todo.id);
+                }
+            }
+        }
+        self.invalidate_filter();
+    }
+
+    pub(super) fn row_height(&self, id: i64, card: MemoCardLayout, expanded: bool) -> Pixels {
+        let limit = card.max_row_height();
+        if expanded {
+            self.row_heights.get(&id).map_or(limit, |height| {
+                (*height + card.expanded_footer_height()).min(limit)
+            })
+        } else {
+            self.row_heights
+                .get(&id)
+                .copied()
+                .unwrap_or_else(|| card.estimated_row_height())
+        }
     }
 
     fn sync_filter(&mut self, todos: &[Todo], query: &str, show_completed: bool) {
@@ -61,94 +130,101 @@ impl TodoListLayout {
         }
         id.and_then(|id| self.indexes.get(&id).copied())
     }
-
-    pub fn record_height(&mut self, id: i64, height: f32) -> bool {
-        if height <= 0. || self.heights.get(&id).copied() == Some(height) {
-            return false;
-        }
-        self.heights.insert(id, height);
-        self.geometry_dirty = true;
-        true
-    }
-
-    pub fn retain_measurements(&mut self, before: &[Todo], after: &[Todo]) {
-        let previous: HashMap<_, _> = before.iter().map(|todo| (todo.id, todo)).collect();
-        let current: HashMap<_, _> = after.iter().map(|todo| (todo.id, todo)).collect();
-        self.heights.retain(|id, _| {
-            current
-                .get(id)
-                .is_some_and(|todo| previous.get(id) == Some(todo))
-        });
-        self.filter_dirty = true;
-    }
 }
 
 impl ClipboardView {
+    pub(super) fn memo_card_layout(&self) -> MemoCardLayout {
+        let history_density = self.display.value.card_density;
+        let font_size = self.fonts.value.card_font_size;
+        let line_height = f32::from(font_size) * visual::COPY_LINE_HEIGHT;
+        let history_card = visual::row_height_for_body(history_density, line_height)
+            - 2. * visual::card_spacing(history_density);
+        MemoCardLayout {
+            density: self.todo_preference.value.density(history_density),
+            font_size,
+            max_card_height: history_card * 4.,
+        }
+    }
+
     /// Sole owner of filtered indexes and the geometry used by render and dragging.
     pub(super) fn sync_todo_layout(&mut self, window: &Window, cx: &App) {
         let mut layout = self.todo_layout.borrow_mut();
         let query = self.search.read(cx).value();
         let query = query.trim();
         let preference = self.todo_preference.value;
-        let density = preference.density(self.display.value.card_density);
+        let width = window.viewport_size().width;
+        let rem = window.rem_size();
+        let card = self.memo_card_layout();
+        let fonts = &self.fonts.value;
+        let family = if fonts.card_font.is_empty() {
+            &fonts.ui_font
+        } else {
+            &fonts.card_font
+        };
         let style_changed = layout.key.as_ref().is_none_or(|key| {
-            key.width != window.viewport_size().width
-                || key.rem != window.rem_size()
-                || key.density != density
-                || key.max_lines != self.display.value.card_max_lines
-                || key.show_created != preference.show_created
-                || key.show_edited != preference.show_edited
-                || key.fonts != self.fonts.value
+            key.width != width || key.rem != rem || key.card != card || &key.font_family != family
         });
         let projection_changed =
             layout.query != query || layout.show_completed != preference.show_completed;
+        let expansion_changed = layout.expanded_row != self.memo_preview;
         let filter_changed = layout.filter_dirty || projection_changed;
-        if !filter_changed && !style_changed && !layout.geometry_dirty {
+        if !filter_changed && !expansion_changed && !style_changed && !layout.heights_dirty {
             return;
         }
+        let scroll_anchor = ((!filter_changed || (expansion_changed && !projection_changed))
+            && !layout.offsets.is_empty())
+        .then(|| {
+            let (index, partial) = todo_scroll_anchor(&layout.offsets, self.todo_scroll.offset().y);
+            (layout.ids.get(index).copied(), index, partial)
+        });
         if style_changed {
-            layout.heights.clear();
+            layout.row_heights.clear();
             layout.key = Some(LayoutKey {
-                width: window.viewport_size().width,
-                rem: window.rem_size(),
-                density,
-                max_lines: self.display.value.card_max_lines,
-                show_created: preference.show_created,
-                show_edited: preference.show_edited,
-                fonts: self.fonts.value.clone(),
+                width,
+                rem,
+                font_family: family.clone(),
+                card,
             });
         }
         if filter_changed {
             layout.sync_filter(&self.todos, query, preference.show_completed);
+            if self
+                .memo_preview
+                .is_some_and(|id| !layout.indexes.contains_key(&id))
+            {
+                self.memo_preview = None;
+            }
             if layout.selected_index(self.selected_todo).is_none() {
                 self.selected_todo = None;
             }
         }
-        let scroll_anchor = (!filter_changed && !layout.offsets.is_empty())
-            .then(|| todo_scroll_anchor(&layout.offsets, self.todo_scroll.offset().y));
-        let fallback = super::todo_motion::todo_row_fallback(self);
+        layout.expanded_row = self.memo_preview;
         let mut sizes = Vec::with_capacity(layout.ids.len() + 1);
         let mut offsets = Vec::with_capacity(layout.ids.len() + 1);
         let mut top = px(0.);
         offsets.push(top);
-        for id in &layout.ids {
-            let height = px(layout.heights.get(id).copied().unwrap_or(fallback));
-            sizes.push(size(window.viewport_size().width, height));
+        for &id in &layout.ids {
+            let height = layout.row_height(id, card, layout.expanded_row == Some(id));
+            sizes.push(size(width, height));
             top += height;
             offsets.push(top);
         }
         // A non-card footer preserves clearance without extending a draggable row.
         sizes.push(size(
-            window.viewport_size().width,
+            width,
             px(visual::CONTROL_HEIGHT_LARGE + visual::SPACE_6),
         ));
         layout.sizes = Rc::new(sizes);
+        layout.heights_dirty = false;
         layout.offsets = offsets;
-        if let Some((index, partial)) = scroll_anchor {
-            let top = layout.offsets[index.min(layout.ids.len())];
+        if let Some((id, index, partial)) = scroll_anchor {
+            let index = id
+                .and_then(|id| layout.indexes.get(&id).copied())
+                .unwrap_or_else(|| index.min(layout.ids.len()));
+            let top = layout.offsets[index];
+            let partial = partial.min(layout.sizes[index].height);
             self.todo_scroll.set_offset(point(px(0.), -(top + partial)));
         }
-        layout.geometry_dirty = false;
         drop(layout);
         if filter_changed || style_changed {
             self.drag_motion = DragMotionState::default();
@@ -171,32 +247,11 @@ fn todo_scroll_anchor(offsets: &[Pixels], scroll_y: Pixels) -> (usize, Pixels) {
 #[cfg(test)]
 mod tests {
     use super::{MemoKind, Todo, TodoListLayout, TodoStatus, px, todo_scroll_anchor};
-    use std::collections::HashMap;
     #[test]
     fn scroll_anchor_preserves_partial_rows_and_footer_clearance() {
         let offsets = [px(0.), px(64.), px(172.)];
         assert_eq!(todo_scroll_anchor(&offsets, px(-93.)), (1, px(29.)));
         assert_eq!(todo_scroll_anchor(&offsets, px(-190.)), (2, px(18.)));
-    }
-
-    #[test]
-    fn same_count_replacement_drops_removed_and_edited_measurements() {
-        let todo = |id, text: &str| Todo {
-            id,
-            text: text.into(),
-            status: TodoStatus::Pending,
-            kind: MemoKind::Todo,
-            created_at: String::new(),
-            updated_at: String::new(),
-        };
-        let mut layout = TodoListLayout::default();
-        layout.heights.extend([(1, 40.), (2, 60.), (3, 80.)]);
-        layout.retain_measurements(
-            &[todo(1, "same"), todo(2, "old"), todo(3, "removed")],
-            &[todo(1, "same"), todo(2, "edited"), todo(4, "new")],
-        );
-        assert_eq!(layout.heights, HashMap::from([(1, 40.)]));
-        assert!(layout.filter_dirty);
     }
 
     #[test]

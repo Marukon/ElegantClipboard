@@ -321,6 +321,7 @@ impl ClipboardView {
             return;
         }
         self.close_hover_preview("main_hiding", cx);
+        self.close_memo_preview(cx);
         if let Some(interrupted) = self.paste_state.hide() {
             self.apply_paste_interruption(interrupted);
         }
@@ -336,7 +337,7 @@ impl ClipboardView {
             self.arm_history_query(reload, false, cx);
         }
     }
-    /// 当前打开的覆盖层，按 Esc 关闭优先级排列（同时至多一层）。
+    /// 按 Esc 处理当前编辑器或覆盖层。
     pub(super) fn active_overlay(&self) -> Option<Overlay> {
         if self.note_original.is_some() {
             Some(Overlay::Editor)
@@ -395,6 +396,10 @@ impl ClipboardView {
                 }
             }
             None => {
+                if self.close_memo_preview(cx) {
+                    window.focus(&self.list_focus, cx);
+                    return;
+                }
                 if self.paste_state.pending() || self.paste_state.merging() {
                     return;
                 }

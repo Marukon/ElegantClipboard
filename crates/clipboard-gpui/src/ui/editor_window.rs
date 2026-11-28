@@ -1,5 +1,5 @@
+use super::todo_editor::TodoDraft;
 use super::*;
-use gpui_kit::component::tab::{Tab, TabBar};
 
 pub(super) const CONTEXT: &str = "ContentEditor";
 const EDITOR_WIDTH: f32 = 640.;
@@ -22,13 +22,10 @@ pub(super) fn bind_keys(cx: &mut App) {
     ]);
 }
 
-pub(super) fn editor_title(
-    language: LanguagePreference,
-    adding_todo: Option<bool>,
-) -> &'static str {
-    match adding_todo {
-        Some(true) => tr(language, "添加备忘录", "Add memo"),
-        Some(false) => tr(language, "编辑备忘录", "Edit memo"),
+pub(super) fn editor_title(language: LanguagePreference, memo: Option<TodoDraft>) -> &'static str {
+    match memo {
+        Some(TodoDraft::New(_)) => tr(language, "添加备忘录", "Add memo"),
+        Some(TodoDraft::Edit(_)) => tr(language, "编辑备忘录", "Edit memo"),
         None => tr(language, "编辑内容", "Edit content"),
     }
 }
@@ -69,49 +66,6 @@ pub(super) fn markdown_preview_source(text: &str) -> String {
     out
 }
 
-pub(super) fn memo_kind_toggle(
-    adding: bool,
-    kind: Option<MemoKind>,
-    language: LanguagePreference,
-    owner: WeakEntity<ClipboardView>,
-    pending: bool,
-) -> AnyElement {
-    if !adding {
-        return div().into_any_element();
-    }
-    let labels = [tr(language, "待办", "To-do"), tr(language, "笔记", "Note")];
-    TabBar::new("memo-kind")
-        .segmented()
-        .h(px(visual::CONTROL_HEIGHT))
-        .w(px(168.))
-        .selected_index(usize::from(kind == Some(MemoKind::Note)))
-        .children(labels.map(|label| {
-            Tab::new()
-                .label(label)
-                .disabled(pending)
-                .text_size(px(visual::TEXT_SMALL))
-                .aria_label(label)
-                .flex_1()
-        }))
-        .on_click(move |index: &usize, _, cx| {
-            let next = if *index == 0 {
-                MemoKind::Todo
-            } else {
-                MemoKind::Note
-            };
-            let _ = owner.update(cx, |view, cx| {
-                if view.todo_edit_saving || view.editor_discard_open {
-                    return;
-                }
-                if let Some(draft) = view.todo_draft.as_mut().filter(|draft| draft.id.is_none()) {
-                    draft.kind = next;
-                }
-                cx.notify();
-            });
-        })
-        .into_any_element()
-}
-
 pub(super) fn request_standalone_editor_close(
     owner: &WeakEntity<ClipboardView>,
     window: &mut Window,
@@ -128,18 +82,6 @@ pub(super) fn request_standalone_editor_close(
 }
 
 impl ClipboardView {
-    /// 历史面板太小，正文编辑使用可缩放的独立窗口，而不是嵌在面板里的对话框。
-    pub(super) fn open_content_editor(
-        &mut self,
-        id: i64,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.open_editor_window(window, cx, move |view| {
-            view.editor.id == Some(id) && view.editor_window.is_none()
-        });
-    }
-
     pub(super) fn lower_main_for_editor(&mut self, window: &Window) {
         if let Some(level) = native_window::lower_for_editor(window) {
             self.editor_main_level = Some(level);
@@ -171,13 +113,15 @@ impl ClipboardView {
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
-        still_waiting: impl Fn(&ClipboardView) -> bool + 'static,
+        memo_source: Option<SharedString>,
     ) {
         let display_id = window.display(cx).map(|display| display.id());
         let bounds = Bounds::centered(display_id, size(px(EDITOR_WIDTH), px(EDITOR_HEIGHT)), cx);
         let theme = self.theme;
         let language = self.language;
-        let adding_todo = self.todo_draft.as_ref().map(|draft| draft.id.is_none());
+        let memo = self.todo_draft;
+        let generation = self.editor.generation;
+        let title = editor_title(language, memo);
         let window_effect = self.window_effect.value;
         let main_window = window.window_handle();
         let owner = cx.weak_entity();
@@ -185,8 +129,12 @@ impl ClipboardView {
             let Some(owner_entity) = owner.upgrade() else {
                 return;
             };
-            let still_waiting = owner_entity.update(cx, |view, _| still_waiting(view));
-            if !still_waiting {
+            let view = owner_entity.read(cx);
+            let current = match memo {
+                Some(draft) => view.todo_draft == Some(draft),
+                None => view.editor.generation == generation && view.editor_source_hash.is_some(),
+            };
+            if !current || view.editor_window.is_some() {
                 return;
             }
             // Panel is topmost and non-activating; drop that before the editor exists.
@@ -197,7 +145,7 @@ impl ClipboardView {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 display_id,
                 titlebar: Some(TitlebarOptions {
-                    title: Some(editor_title(language, adding_todo).into()),
+                    title: Some(title.into()),
                     ..TitleBar::title_bar_options()
                 }),
                 window_min_size: Some(size(px(EDITOR_MIN_WIDTH), px(EDITOR_MIN_HEIGHT))),
@@ -211,12 +159,14 @@ impl ClipboardView {
             let opened = gpui_kit::open_window(options, cx, move |window, cx| {
                 apply_theme(theme, window, cx);
                 acrylic::init_window_effect(window_effect, window, cx);
-                window.set_window_title(editor_title(language, adding_todo));
+                window.set_window_title(title);
                 window.on_window_should_close(cx, move |window, cx| {
                     request_standalone_editor_close(&close_owner, window, cx);
                     false
                 });
-                cx.new(|cx| content_editor::ContentEditorWindow::new(editor_owner, window, cx))
+                cx.new(|cx| {
+                    content_editor::ContentEditorWindow::new(editor_owner, memo_source, window, cx)
+                })
             });
             let handle = owner_entity.update(cx, |owner, cx| {
                 let handle = match opened {

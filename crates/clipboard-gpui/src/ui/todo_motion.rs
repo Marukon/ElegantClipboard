@@ -20,17 +20,13 @@ impl ClipboardView {
             before.insert(placement.insertion, moved);
         }
         let after = visible_todo_ids(next, show_completed, &query);
-        let layout = self.todo_layout.borrow();
-        let fallback = todo_row_fallback(self);
-        let offsets = slide_offsets(&before, &after, |id| {
-            layout
-                .heights
-                .get(&id)
-                .copied()
-                .filter(|height| *height > 0.)
-                .unwrap_or(fallback)
-        });
-        drop(layout);
+        let card = self.memo_card_layout();
+        let offsets = {
+            let layout = self.todo_layout.borrow();
+            slide_offsets(&before, &after, |id| {
+                f32::from(layout.row_height(id, card, false))
+            })
+        };
         match offsets {
             Some(offsets) if !offsets.is_empty() => {
                 self.todo_motion_revision = self.todo_motion_revision.wrapping_add(1);
@@ -63,22 +59,6 @@ fn visible_todo_ids(todos: &[Todo], show_completed: bool, query: &str) -> Vec<i6
         })
         .map(|todo| todo.id)
         .collect()
-}
-
-pub(super) fn todo_row_fallback(view: &ClipboardView) -> f32 {
-    let density = view
-        .todo_preference
-        .value
-        .density(view.display.value.card_density);
-    let preference = view.todo_preference.value;
-    let body = visual::PREVIEW_LINE_HEIGHT
-        + if preference.show_created || preference.show_edited {
-            visual::card_spacing(density) + visual::METADATA_ROW_HEIGHT
-        } else {
-            0.
-        };
-    let spacing = visual::card_spacing(density);
-    spacing * 2. + visual::card_padding(density) * 2. + visual::BORDER_WIDTH * 2. + body
 }
 
 /// `None` when the visible set changed. An empty map means the same order.

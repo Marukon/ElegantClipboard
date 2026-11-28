@@ -249,6 +249,7 @@ impl ClipboardView {
         if self.located.take().is_some() && !self.search.read(cx).value().is_empty() {
             self.history.invalidate_all_view();
         }
+        self.close_memo_preview(cx);
         self.todos_open = false;
         self.selected_todo = None;
         self.sync_search_prompt(window, cx);
